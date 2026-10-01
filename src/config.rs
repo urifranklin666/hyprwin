@@ -1,0 +1,334 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+
+/// Tiling layout algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutKind {
+    Dwindle,
+    Master,
+}
+
+impl Default for LayoutKind {
+    fn default() -> Self {
+        LayoutKind::Dwindle
+    }
+}
+
+/// Direction used for focus/move/resize commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Direction {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "left" | "l" | "west" => Some(Direction::Left),
+            "right" | "r" | "east" => Some(Direction::Right),
+            "up" | "u" | "north" => Some(Direction::Up),
+            "down" | "d" | "south" => Some(Direction::Down),
+            _ => None,
+        }
+    }
+}
+
+/// A single keybinding. `action` is a command name, `arg` its optional parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keybind {
+    #[serde(default)]
+    pub mods: Vec<String>,
+    pub key: String,
+    pub action: String,
+    #[serde(default)]
+    pub arg: Option<String>,
+}
+
+/// Window rule: match an application and apply an action.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Rule {
+    /// Match against the executable file name, e.g. "explorer.exe".
+    #[serde(default)]
+    pub exe: Option<String>,
+    /// Match against the Win32 window class, e.g. "Notepad".
+    #[serde(default)]
+    pub class: Option<String>,
+    /// Match against a substring of the window title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// "float" | "ignore" | "workspace"
+    pub action: String,
+    /// Workspace number for action "workspace".
+    #[serde(default)]
+    pub arg: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Primary modifier: "alt" | "ctrl" | "shift" | "win".
+    pub main_mod: String,
+    /// Gap between the tiled area and the monitor work area, in pixels.
+    pub gaps_outer: i32,
+    /// Gap between individual windows, in pixels.
+    pub gaps_inner: i32,
+    /// Paint the DWM accent border on the focused window.
+    pub show_border: bool,
+    /// Active window border colour, "#RRGGBB".
+    pub border_color_active: String,
+    /// Inactive window border colour, "#RRGGBB".
+    pub border_color_inactive: String,
+    /// DWM corner preference: 0 = default, 1 = do not round, 2 = round.
+    pub rounding: i32,
+    /// Animation duration in milliseconds. 0 disables animation.
+    pub animation_ms: u32,
+    /// Easing: "linear" | "quad" | "cubic" | "expo".
+    pub animation_easing: String,
+    /// Number of virtual workspaces per monitor.
+    pub workspaces: u32,
+    pub default_layout: LayoutKind,
+    /// Master area share for the "master" layout, 0.1..0.9.
+    pub master_ratio: f32,
+    /// Re-tile all currently open windows on startup. When false, HyprWin only
+    /// takes over windows that appear after it starts.
+    pub manage_on_start: bool,
+    /// Register the binary to run at login (HKCU Run key).
+    pub autostart: bool,
+    pub keybinds: Vec<Keybind>,
+    pub rules: Vec<Rule>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            main_mod: "alt".to_string(),
+            gaps_outer: 8,
+            gaps_inner: 6,
+            show_border: true,
+            border_color_active: "#7aa2f7".to_string(),
+            border_color_inactive: "#3b4261".to_string(),
+            rounding: 2,
+            animation_ms: 120,
+            animation_easing: "cubic".to_string(),
+            workspaces: 9,
+            default_layout: LayoutKind::Dwindle,
+            master_ratio: 0.6,
+            manage_on_start: true,
+            autostart: false,
+            keybinds: default_keybinds(),
+            rules: default_rules(),
+        }
+    }
+}
+
+fn kb(mods: &[&str], key: &str, action: &str, arg: Option<&str>) -> Keybind {
+    Keybind {
+        mods: mods.iter().map(|s| s.to_string()).collect(),
+        key: key.to_string(),
+        action: action.to_string(),
+        arg: arg.map(|s| s.to_string()),
+    }
+}
+
+/// Default binds use Alt, not Win: Windows reserves Win+Arrow and Win+0-9.
+fn default_keybinds() -> Vec<Keybind> {
+    let m = "main";
+    let mut v = vec![
+        // Focus (vim style).
+        kb(&[m], "H", "focus", Some("left")),
+        kb(&[m], "J", "focus", Some("down")),
+        kb(&[m], "K", "focus", Some("up")),
+        kb(&[m], "L", "focus", Some("right")),
+        kb(&[m], "Left", "focus", Some("left")),
+        kb(&[m], "Down", "focus", Some("down")),
+        kb(&[m], "Up", "focus", Some("up")),
+        kb(&[m], "Right", "focus", Some("right")),
+        // Move the focused window through the layout.
+        kb(&[m, "shift"], "H", "move", Some("left")),
+        kb(&[m, "shift"], "J", "move", Some("down")),
+        kb(&[m, "shift"], "K", "move", Some("up")),
+        kb(&[m, "shift"], "L", "move", Some("right")),
+        // Resize the nearest split.
+        kb(&[m, "ctrl"], "H", "resize", Some("left")),
+        kb(&[m, "ctrl"], "J", "resize", Some("down")),
+        kb(&[m, "ctrl"], "K", "resize", Some("up")),
+        kb(&[m, "ctrl"], "L", "resize", Some("right")),
+        // Layout.
+        kb(&[m], "V", "togglefloating", None),
+        kb(&[m], "F", "fullscreen", None),
+        kb(&[m], "Space", "togglelayout", None),
+        kb(&[m], "Q", "close", None),
+        // Workspaces.
+        // Not Alt+Tab: Windows owns that chord for the task switcher, so
+        // RegisterHotKey rejects it. Comma/period are unclaimed and vim-ish.
+        // The key is written as the literal character, which is the form the
+        // hotkey parser maps to a virtual-key code.
+        kb(&[m], ",", "workspace", Some("prev")),
+        kb(&[m], ".", "workspace", Some("next")),
+        kb(&[m], "R", "reload", None),
+    ];
+    for n in 1..=9u32 {
+        let k = n.to_string();
+        v.push(kb(&[m], &k, "workspace", Some(&k)));
+        v.push(kb(&[m, "shift"], &k, "movetoworkspace", Some(&k)));
+    }
+    v
+}
+
+fn default_rules() -> Vec<Rule> {
+    vec![
+        // Standard Win32 dialogs float instead of being tiled.
+        Rule {
+            class: Some("#32770".to_string()),
+            action: "float".to_string(),
+            ..Default::default()
+        },
+        Rule {
+            exe: Some("Taskmgr.exe".to_string()),
+            action: "float".to_string(),
+            ..Default::default()
+        },
+        // Picture-in-picture style always-on-top utility windows.
+        Rule {
+            class: Some("ApplicationFrameWindow".to_string()),
+            action: "workspace".to_string(),
+            arg: Some("3".to_string()),
+            ..Default::default()
+        },
+    ]
+}
+
+impl Config {
+    pub fn dir() -> PathBuf {
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(base).join("hyprwin")
+    }
+
+    pub fn path() -> PathBuf {
+        Self::dir().join("config.json")
+    }
+
+    /// Load the config, writing a default file on first run.
+    pub fn load_or_create() -> Result<Self> {
+        let path = Self::path();
+        if path.exists() {
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let cfg: Config = serde_json::from_str(&text)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            cfg.validate()?;
+            Ok(cfg)
+        } else {
+            let cfg = Config::default();
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            let text = serde_json::to_string_pretty(&cfg)?;
+            fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+            Ok(cfg)
+        }
+    }
+
+    /// Reject configurations that would panic or behave nonsensically.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.workspaces >= 1, "workspaces must be >= 1");
+        anyhow::ensure!(self.workspaces <= 36, "workspaces must be <= 36");
+        anyhow::ensure!(self.gaps_outer >= 0, "gaps_outer must be >= 0");
+        anyhow::ensure!(self.gaps_inner >= 0, "gaps_inner must be >= 0");
+        anyhow::ensure!(
+            self.master_ratio > 0.1 && self.master_ratio < 0.9,
+            "master_ratio must be between 0.1 and 0.9"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.main_mod.trim().to_ascii_lowercase().as_str(),
+                "alt" | "ctrl" | "control" | "shift" | "win" | "super" | "meta"
+            ),
+            "main_mod must be one of alt, ctrl, shift, win"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.animation_easing.trim().to_ascii_lowercase().as_str(),
+                "linear" | "quad" | "cubic" | "expo"
+            ),
+            "animation_easing must be linear, quad, cubic or expo"
+        );
+        Ok(())
+    }
+
+    /// Resolve `main_mod` to a lowercase canonical token.
+    pub fn main_mod_token(&self) -> String {
+        match self.main_mod.trim().to_ascii_lowercase().as_str() {
+            "control" => "ctrl".to_string(),
+            "super" | "meta" => "win".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// Parse "#RRGGBB" or "#AARRGGBB" into a Win32 COLORREF (0x00BBGGRR).
+pub fn parse_color(s: &str) -> u32 {
+    let t = s.trim().trim_start_matches('#').trim_start_matches("0x");
+    let v = u32::from_str_radix(t, 16).unwrap_or(0);
+    let r = (v >> 16) & 0xFF;
+    let g = (v >> 8) & 0xFF;
+    let b = v & 0xFF;
+    (b << 16) | (g << 8) | r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_parsing_is_bgr() {
+        assert_eq!(parse_color("#FF8000"), 0x0080FF);
+        assert_eq!(parse_color("0000FF"), 0xFF0000);
+        // Alpha is ignored: DWM border colours do not support transparency.
+        assert_eq!(parse_color("#80FF0000"), 0x0000FF);
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        Config::default().validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn main_mod_canonicalises_super() {
+        let mut c = Config::default();
+        c.main_mod = "Super".to_string();
+        assert_eq!(c.main_mod_token(), "win");
+    }
+
+    #[test]
+    fn rejects_insane_master_ratio() {
+        let mut c = Config::default();
+        c.master_ratio = 0.95;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn default_binds_cover_every_workspace() {
+        let binds = default_keybinds();
+        for n in 1..=9u32 {
+            let k = n.to_string();
+            assert!(binds
+                .iter()
+                .any(|b| b.action == "workspace" && b.arg.as_deref() == Some(k.as_str())));
+            assert!(binds
+                .iter()
+                .any(|b| b.action == "movetoworkspace" && b.arg.as_deref() == Some(k.as_str())));
+        }
+    }
+
+    #[test]
+    fn direction_parsing() {
+        assert_eq!(Direction::parse("LEFT"), Some(Direction::Left));
+        assert_eq!(Direction::parse(" hmm "), None);
+    }
+}
