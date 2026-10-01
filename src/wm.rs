@@ -684,13 +684,28 @@ impl Wm {
         // Remember the window's own shape so pulling the scratchpad up hands it
         // back rather than leaving it at the drop-down size.
         let saved = win32::rect_of(hwnd).unwrap_or(Rect::new(0, 0, 800, 600));
-        self.scratch_saves.insert(id, saved);
+        self.remember_scratch_shape(id, saved);
         if let Some(w) = self.windows.get_mut(&id) {
             w.floating = false;
         }
         self.workspaces.set_floating(id, false);
         win32::unmaximize(hwnd);
         win32::set_foreground(hwnd);
+    }
+
+    /// Remember a scratchpad window's own shape, but never overwrite a save that
+    /// already exists.
+    ///
+    /// A re-drop that follows a workspace switch happens while the window still
+    /// sits at the drop-down rect, because the switch pulls the pad up by
+    /// flipping the visibility flag rather than going through
+    /// `unfocus_scratchpad`. Capturing the shape unconditionally would record the
+    /// drop-down rect as the window's own geometry, and `reveal_all` would hand
+    /// that back on exit.
+    fn remember_scratch_shape(&mut self, id: usize, rect: Rect) {
+        if !self.scratch_saves.contains_key(&id) {
+            self.scratch_saves.insert(id, rect);
+        }
     }
 
     /// Pull the scratchpad window back up: restore its own shape and re-tile it.
@@ -1157,11 +1172,9 @@ impl Wm {
         }
         // Make sure the window's shape is remembered before the retile blows it
         // up, so pulling the scratchpad up can hand it back.
-        if !self.scratch_saves.contains_key(&focus) {
-            if let Some(hwnd) = self.hwnd_of(focus) {
-                if let Some(r) = win32::rect_of(hwnd) {
-                    self.scratch_saves.insert(focus, r);
-                }
+        if let Some(hwnd) = self.hwnd_of(focus) {
+            if let Some(r) = win32::rect_of(hwnd) {
+                self.remember_scratch_shape(focus, r);
             }
         }
         self.retile_monitor(mon);
@@ -1306,6 +1319,28 @@ use crate::config::Direction as WmDirection;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A re-drop that follows a workspace switch happens while the window still
+    /// sits at the drop-down rect, so the save must survive it. Without this,
+    /// `reveal_all` restores the drop-down geometry on exit.
+    #[test]
+    fn a_scratchpad_reshape_never_overwrites_the_saved_shape() {
+        let mut wm = Wm::new(Config::default());
+        let own = Rect::new(100, 120, 900, 700);
+        let dropped = Rect::new(-1621, 331, 1322, 700);
+
+        wm.remember_scratch_shape(1, own);
+        wm.remember_scratch_shape(1, dropped);
+        assert_eq!(
+            wm.scratch_saves.get(&1).copied(),
+            Some(own),
+            "the window's own shape must win, not the drop-down rect"
+        );
+
+        // A different window is remembered independently.
+        wm.remember_scratch_shape(2, dropped);
+        assert_eq!(wm.scratch_saves.get(&2).copied(), Some(dropped));
+    }
 
     #[test]
     fn rule_matching_is_case_insensitive_and_substring_based() {
