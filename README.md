@@ -13,7 +13,7 @@ komorebi and GlazeWM, and it is the only model Windows permits.
 
 ## Status
 
-Working, verified by the unit suite (`71 passed`), a clean release build and a
+Working, verified by the unit suite (`82 passed`), a clean release build and a
 live run against a two-monitor desktop. See
 [Manual smoke test](#manual-smoke-test) for the checklist to run yourself.
 
@@ -23,14 +23,18 @@ live run against a two-monitor desktop. See
 |---|---|
 | Dynamic tiling | Dwindle (spiral) and master/stack layouts |
 | Minimized windows leave the layout | Minimizing reflows the other windows to fill the gap; restoring puts the window back in the slot it had |
+| Maximized windows are re-tiled | A window maximised after it was adopted is un-maximised on the next retile instead of sitting zoomed over its tile |
 | Persistent split ratios | Resizing one split survives retiling; other windows do not jump |
 | Per-workspace layout memory | Leaving a workspace parks its dwindle tree, so windows return to the position they had |
 | Clean exit | Quitting un-hides windows parked on other workspaces and restores their original geometry |
 | Gaps | Configurable outer (edge) and inner (between windows) |
 | Borders + rounding | DWM accent border, active/inactive colours, Win11 corner rounding |
 | Virtual workspaces | Per-monitor, numbered; off-workspace windows are hidden and shown again on return, with one raised into focus |
+| Scratchpad | A drop-down window over whatever workspace you are on, hideable with one key and reachable from any workspace |
+| Move between monitors | `movetomonitor` sends the focused window to the other display |
 | Keybinds | Configurable, with a `main` placeholder for the primary modifier |
-| Window rules | Match exe / class / title, then float, ignore, or pin to a workspace |
+| Window rules | Match exe / class / title, then float (optionally by size), ignore, pin to a workspace, or send to a monitor or the scratchpad |
+| Status output | Writes `status.json` (active workspace, layout, focus, window counts, work areas) for a Rainmeter skin or any other dashboard to read |
 | Animations | Eased interpolation of moves and resizes (best effort) |
 | Tray icon | Reload config / toggle tiling / quit |
 | Autostart | Optional `HKCU\...\Run` registration |
@@ -102,10 +106,28 @@ Quit from the tray icon, or with `Ctrl+C` in the console.
 | `main` + `1`..`9` | Switch to workspace 1..9 |
 | `main` + `Shift` + `1`..`9` | Move the focused window to workspace 1..9 |
 | `main` + `,` / `main` + `.` | Previous / next workspace |
+| `main` + `Shift` + `,` / `main` + `Shift` + `.` | Send the focused window to the previous / next monitor |
+| `main` + `S` | Move the focused window onto the scratchpad and drop it down |
+| `main` + `Shift` + `S` | Show / hide the scratchpad |
 
 > `Alt+Tab` and `Alt+Shift+Tab` are **not** used: Windows reserves them for the
 > task switcher, so `RegisterHotKey` rejects them. HyprWin logs every rejected
 > binding at startup rather than dropping it silently.
+
+### The scratchpad
+
+The scratchpad is one window — a terminal, a notes pane, whatever — that you can
+summon over any workspace and hide again. It is not a tenth desktop: it has its
+own layout tree, so dropping it down never disturbs the layout underneath, and
+it stays put while you switch workspaces until you pull it back up.
+
+- `main` + `S` puts the focused window on the scratchpad and shows it.
+- `main` + `Shift` + `S` toggles it: down over the current workspace, or away.
+- With nothing on the scratchpad yet, the toggle simply shows nothing. Put a
+  window on it with `main` + `S` first.
+
+It is deliberately explicit: the toggle never picks a window for you, so the
+same chord always means the same thing whatever is focused.
 
 ## Configuration
 
@@ -128,6 +150,8 @@ the documented default.
   "master_ratio": 0.6,
   "manage_on_start": true,
   "autostart": false,
+  "status_file": true,
+  "status_path": "",
   "keybinds": [],
   "rules": []
 }
@@ -148,6 +172,8 @@ the documented default.
 | `master_ratio` | Master share for `master` layout, between 0.1 and 0.9 |
 | `manage_on_start` | Adopt already-open windows on startup; when `false`, only windows that appear after startup are tiled |
 | `autostart` | Register the binary in `HKCU\...\Run` |
+| `status_file` | Write the status document described below |
+| `status_path` | Where to write it; empty means `status.json` beside `config.json` |
 
 ### Keybinds
 
@@ -162,9 +188,14 @@ the documented default.
 
 `mods` accepts `main`, `alt`, `ctrl`, `shift`, `win`. `key` is a single
 character (`1`, `Q`), a named key (`Left`, `Space`, `Tab`, `PageUp`, `F1`–`F24`)
-or a punctuation key. Actions are `focus`, `move`, `resize`,
-`togglefloating`, `fullscreen`, `togglelayout`, `workspace`,
-`movetoworkspace`, `close` and `reload`.
+or a punctuation key. Actions are `focus`, `move`, `resize`, `togglefloating`,
+`fullscreen`, `togglelayout`, `workspace`, `movetoworkspace`, `movetomonitor`,
+`scratchpad`, `movetoscratchpad`, `close` and `reload`.
+
+`movetomonitor` takes `next`, `prev`, or a monitor named by index (`1`, `2`,
+primary first) or `primary`. Workspace numbers are per-monitor, so a window sent
+to the next monitor lands on whatever workspace that monitor is showing — the
+only assignment that keeps it visible when it arrives.
 
 ### Window rules
 
@@ -179,9 +210,55 @@ or a punctuation key. Actions are `focus`, `move`, `resize`,
 All specified fields must match; matching is case-insensitive substring.
 `action` is one of:
 
-- `float` — tile-exempt, keeps its own geometry
+- `float` — tile-exempt, keeps its own geometry. With no `arg`, it always
+  floats. With an `arg` like `"400x300"`, it floats only windows *smaller* than
+  that, so one rule can catch every tool palette without touching real windows.
+  A rule with no `exe`/`class`/`title` and a size `arg` is the "float anything
+  tiny" rule, and ships by default.
 - `ignore` — HyprWin never touches it
 - `workspace` — send it to `arg` (a workspace number) on creation
+- `monitor` — send it to `arg` (`next`, `prev`, `1`, `2`, … or `primary`)
+- `scratchpad` — adopt it onto the scratchpad and drop it down
+
+---
+
+## Status output
+
+When `status_file` is true (the default), HyprWin writes
+`%APPDATA%\hyprwin\status.json` on every change, for a Rainmeter skin or any
+other dashboard to read. It is replaced atomically, so a reader polling it never
+sees a half-written file, and it is the only integration a skin needs — HyprWin
+has no bar of its own.
+
+```json
+{
+  "running": true,
+  "pid": 4242,
+  "tiling_enabled": true,
+  "focused": {
+    "title": "notes.md - Notepad",
+    "exe": "notepad.exe",
+    "monitor": 1
+  },
+  "monitors": [
+    {
+      "index": 1,
+      "primary": true,
+      "active_workspace": 3,
+      "layout": "dwindle",
+      "windows": 2,
+      "scratchpad": false,
+      "scratchpad_windows": 0,
+      "work_area": { "x": 0, "y": 0, "w": 2560, "h": 1392 }
+    }
+  ]
+}
+```
+
+- `monitors[].index` is 1-based, primary first, and matches the number a
+  `monitor` rule uses.
+- `focused.monitor` is `0` when the focused window is not one HyprWin manages.
+- `running` goes `false` on a clean exit, so a skin can stop showing live data.
 
 ---
 
@@ -201,6 +278,7 @@ All specified fields must match; matching is case-insensitive substring.
 | `config.rs` | Config structs, defaults, validation, colour parsing |
 | `tray.rs` | Tray icon and menu |
 | `autostart.rs` | `HKCU\...\Run` helper |
+| `status.rs` | The `status.json` document and its atomic write |
 | `events.rs` | The channel shared by hooks, tray and the main loop |
 
 Three design points worth knowing:
@@ -209,14 +287,17 @@ Three design points worth knowing:
   dwindle tree per workspace — so leaving a workspace preserves its split ratios
   and window order. The active workspace's tree is re-synced by `ensure_tree`
   on every retile (additions land, closed windows drop out) and written back.
-  A single shared tree would lose the layout on every switch.
+  A single shared tree would lose the layout on every switch. The scratchpad is
+  one more tree in that forest, so it never mixes into the workspace below it.
 - **Events carry raw handle values, not `HWND`.** `HWND` wraps a pointer, so it
   is not `Send`; the channel is written from hook callbacks but read on the main
   thread.
 - **`retile_monitor` is the only writer of geometry, and `apply_visibility` the
   only writer of visibility.** Keeping those two decisions in one place each is
   what prevents a window from being hidden on a workspace switch and never shown
-  again.
+  again, and it is why the scratchpad stays tiled rather than floating while it
+  is down: a floating window is skipped by every retile, so nothing would put it
+  back in place.
 
 ## Manual smoke test
 
@@ -244,6 +325,19 @@ Run `target\release\hyprwin.exe`, then check:
 16. Unplug or mirror a display, or drag the window between monitors — HyprWin
     re-tiles without losing windows.
 17. Start HyprWin with several windows already open, on a multi-monitor setup.
+18. `Alt+Shift+.` (or `,`) sends the focused window to the other monitor; it
+    lands on whatever workspace that monitor is showing and both monitors
+    re-tile.
+19. With two or more windows open, `Alt+S` puts the focused window on the
+    scratchpad and drops it down as a centred panel; the windows underneath keep
+    their layout. `Alt+Shift+S` hides it and `Alt+Shift+S` again brings it back
+    to the **same** rectangle, over a different workspace too.
+20. Maximise a tiled window with the title-bar button (or `Win`+`↑`), then press
+    `Alt+Space`: the window is un-maximised and re-tiled back into the layout
+    instead of staying zoomed over its tile.
+21. Read `%APPDATA%\hyprwin\status.json` after each of the above — the active
+    workspace, layout, focus and window counts track what you see, and `running`
+    becomes `false` after you quit.
 
 ## License
 

@@ -63,7 +63,8 @@ pub struct Rule {
     pub title: Option<String>,
     /// "float" | "ignore" | "workspace"
     pub action: String,
-    /// Workspace number for action "workspace".
+    /// Action argument: a workspace number for "workspace", or a `WxH` size
+    /// limit for "float" (float only when the window is smaller than this).
     #[serde(default)]
     pub arg: Option<String>,
 }
@@ -101,6 +102,10 @@ pub struct Config {
     pub autostart: bool,
     pub keybinds: Vec<Keybind>,
     pub rules: Vec<Rule>,
+    /// Write a small status file for external dashboards (e.g. Rainmeter) to read.
+    pub status_file: bool,
+    /// Path of the status file. Empty means the default in the config directory.
+    pub status_path: String,
 }
 
 impl Default for Config {
@@ -122,6 +127,8 @@ impl Default for Config {
             autostart: false,
             keybinds: default_keybinds(),
             rules: default_rules(),
+            status_file: true,
+            status_path: String::new(),
         }
     }
 }
@@ -170,6 +177,12 @@ fn default_keybinds() -> Vec<Keybind> {
         // hotkey parser maps to a virtual-key code.
         kb(&[m], ",", "workspace", Some("prev")),
         kb(&[m], ".", "workspace", Some("next")),
+        // Per-monitor workspace targeting and window moves.
+        kb(&[m, "shift"], ",", "movetomonitor", Some("prev")),
+        kb(&[m, "shift"], ".", "movetomonitor", Some("next")),
+        // The scratchpad: one window you can drop over any workspace, and hide.
+        kb(&[m], "S", "movetoscratchpad", None),
+        kb(&[m, "shift"], "S", "scratchpad", None),
         kb(&[m], "R", "reload", None),
     ];
     for n in 1..=9u32 {
@@ -193,6 +206,14 @@ fn default_rules() -> Vec<Rule> {
             action: "float".to_string(),
             ..Default::default()
         },
+        // Tiny windows (tool palettes, splash screens) float instead of being
+        // given a tile. `arg` is the size under which a window is "tiny",
+        // written `WxH`.
+        Rule {
+            action: "float".to_string(),
+            arg: Some("400x300".to_string()),
+            ..Default::default()
+        },
         // Picture-in-picture style always-on-top utility windows.
         Rule {
             class: Some("ApplicationFrameWindow".to_string()),
@@ -211,6 +232,19 @@ impl Config {
 
     pub fn path() -> PathBuf {
         Self::dir().join("config.json")
+    }
+
+    /// Where the status document is written.
+    ///
+    /// An empty `status_path` means `status.json` next to `config.json`, which
+    /// keeps a Rainmeter skin's path stable without the user having to type one.
+    pub fn status_path(&self) -> PathBuf {
+        let p = self.status_path.trim();
+        if p.is_empty() {
+            Self::dir().join("status.json")
+        } else {
+            PathBuf::from(p)
+        }
     }
 
     /// Load the config, writing a default file on first run.
@@ -258,6 +292,18 @@ impl Config {
             ),
             "animation_easing must be linear, quad, cubic or expo"
         );
+        for rule in &self.rules {
+            if rule.action == "float" {
+                if let Some(arg) = &rule.arg {
+                    if !arg.trim().is_empty() {
+                        anyhow::ensure!(
+                            size_limit(arg).is_some(),
+                            "float rule arg must be a size like \"400x300\", got {arg:?}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -268,6 +314,19 @@ impl Config {
             "super" | "meta" => "win".to_string(),
             other => other.to_string(),
         }
+    }
+}
+
+/// Parse a `WxH` size limit, e.g. `"400x300"`. Case-insensitive, spaces allowed.
+pub fn size_limit(s: &str) -> Option<(i32, i32)> {
+    let t = s.trim().to_ascii_lowercase();
+    let (w, h) = t.split_once('x')?;
+    let w: i32 = w.trim().parse().ok()?;
+    let h: i32 = h.trim().parse().ok()?;
+    if w > 0 && h > 0 {
+        Some((w, h))
+    } else {
+        None
     }
 }
 
@@ -330,5 +389,67 @@ mod tests {
     fn direction_parsing() {
         assert_eq!(Direction::parse("LEFT"), Some(Direction::Left));
         assert_eq!(Direction::parse(" hmm "), None);
+    }
+
+    #[test]
+    fn size_limits_parse_and_reject_nonsense() {
+        assert_eq!(size_limit("400x300"), Some((400, 300)));
+        assert_eq!(size_limit(" 1280 x 720 "), Some((1280, 720)));
+        assert_eq!(size_limit("400X300"), Some((400, 300)));
+        assert_eq!(size_limit("400"), None);
+        assert_eq!(size_limit("wide"), None);
+        assert_eq!(size_limit("0x300"), None, "a zero dimension is not a limit");
+    }
+
+    #[test]
+    fn the_default_config_floats_tiny_windows() {
+        // The size rule has no exe/class/title, so it must be the `arg` that
+        // carries the meaning; a bare float rule matching everything would float
+        // every window on the desktop.
+        let c = Config::default();
+        let tiny = c
+            .rules
+            .iter()
+            .find(|r| r.action == "float" && r.arg.is_some())
+            .expect("a size-based float rule ships by default");
+        assert_eq!(size_limit(tiny.arg.as_deref().unwrap()), Some((400, 300)));
+        assert!(tiny.exe.is_none() && tiny.class.is_none() && tiny.title.is_none());
+    }
+
+    #[test]
+    fn a_malformed_float_rule_arg_is_rejected() {
+        let mut c = Config::default();
+        c.rules = vec![Rule {
+            action: "float".to_string(),
+            arg: Some("not-a-size".to_string()),
+            ..Default::default()
+        }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn the_status_path_defaults_next_to_the_config() {
+        let c = Config::default();
+        assert_eq!(c.status_path(), Config::dir().join("status.json"));
+        let mut c = Config::default();
+        c.status_path = "D:\\skins\\hyprwin.json".to_string();
+        assert_eq!(c.status_path(), PathBuf::from("D:\\skins\\hyprwin.json"));
+    }
+
+    #[test]
+    fn the_scratchpad_and_monitor_binds_are_registerable() {
+        use crate::hotkey::vk_for;
+        let binds = default_keybinds();
+        for action in ["scratchpad", "movetoscratchpad", "movetomonitor"] {
+            let b = binds
+                .iter()
+                .find(|b| b.action == action)
+                .unwrap_or_else(|| panic!("a default bind for {action} must exist"));
+            assert!(
+                vk_for(&b.key).is_some(),
+                "{action} bind key {} must map to a virtual key",
+                b.key
+            );
+        }
     }
 }

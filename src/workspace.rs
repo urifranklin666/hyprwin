@@ -6,6 +6,14 @@ use std::collections::HashMap;
 
 pub const FLOATING_DEFAULT_WORKSPACE: u32 = 1;
 
+/// Reserved workspace number for the scratchpad.
+///
+/// It sits above the range the `workspace` command can reach (`workspaces` is
+/// capped at 36 and `set_active` clamps), so the only way to bring the
+/// scratchpad on screen is the `scratchpad` command. That is what makes it a
+/// drop-down rather than another numbered desktop.
+pub const SCRATCHPAD_WORKSPACE: u32 = 100;
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceState {
     pub workspace_count: u32,
@@ -15,6 +23,8 @@ pub struct WorkspaceState {
     assignment: HashMap<usize, u32>,
     floating: HashMap<usize, bool>,
     fullscreen: HashMap<usize, bool>,
+    /// monitor handle -> is the scratchpad dropped down right now
+    scratchpad_visible: HashMap<isize, bool>,
 }
 
 impl WorkspaceState {
@@ -47,6 +57,46 @@ impl WorkspaceState {
 
     pub fn assign(&mut self, id: usize, ws: u32) {
         self.assignment.insert(id, ws.clamp(1, self.workspace_count));
+    }
+
+    /// Assign without clamping, so the reserved scratchpad workspace is reachable.
+    ///
+    /// `assign` cannot express it: the scratchpad number is above the configured
+    /// workspace count, so clamping would fold every scratchpad window back onto
+    /// the last ordinary workspace.
+    pub fn assign_raw(&mut self, id: usize, ws: u32) {
+        self.assignment.insert(id, ws);
+    }
+
+    /// Is the scratchpad dropped down on this monitor?
+    pub fn scratchpad_visible(&self, monitor: isize) -> bool {
+        self.scratchpad_visible.get(&monitor).copied().unwrap_or(false)
+    }
+
+    /// Drop the scratchpad down or pull it back up. Returns the new state.
+    pub fn toggle_scratchpad(&mut self, monitor: isize) -> bool {
+        let v = !self.scratchpad_visible(monitor);
+        self.scratchpad_visible.insert(monitor, v);
+        v
+    }
+
+    /// Forget a monitor entirely, including its scratchpad state.
+    pub fn forget_monitor(&mut self, monitor: isize) {
+        self.active.remove(&monitor);
+        self.scratchpad_visible.remove(&monitor);
+    }
+
+    /// Every monitor this state has ever been told about.
+    pub fn known_monitors(&self) -> Vec<isize> {
+        let mut out: Vec<isize> = self
+            .active
+            .keys()
+            .chain(self.scratchpad_visible.keys())
+            .copied()
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     pub fn workspace_of(&self, id: usize) -> u32 {
@@ -191,5 +241,37 @@ mod tests {
         let mut s = WorkspaceState::new(3);
         s.assign(1, 500);
         assert_eq!(s.workspace_of(1), 3);
+    }
+
+    #[test]
+    fn scratchpad_assignment_survives_the_clamp() {
+        // The scratchpad number is above the workspace count on purpose, so the
+        // clamping assign must not be the one used for it.
+        let mut s = WorkspaceState::new(9);
+        s.assign_raw(4, SCRATCHPAD_WORKSPACE);
+        assert_eq!(s.workspace_of(4), SCRATCHPAD_WORKSPACE);
+        s.assign(4, SCRATCHPAD_WORKSPACE);
+        assert_eq!(s.workspace_of(4), 9, "the clamping assign folds it back down");
+    }
+
+    #[test]
+    fn scratchpad_visibility_toggles_per_monitor() {
+        let mut s = WorkspaceState::new(9);
+        assert!(!s.scratchpad_visible(1), "it starts pulled up");
+        assert!(s.toggle_scratchpad(1));
+        assert!(s.scratchpad_visible(1));
+        assert!(!s.scratchpad_visible(2), "the other monitor is untouched");
+        assert!(!s.toggle_scratchpad(1));
+        assert!(!s.scratchpad_visible(1));
+    }
+
+    #[test]
+    fn forgetting_a_monitor_drops_its_scratchpad_state() {
+        let mut s = WorkspaceState::new(9);
+        s.set_active(7, 3);
+        s.toggle_scratchpad(7);
+        s.forget_monitor(7);
+        assert_eq!(s.active(7), 1);
+        assert!(!s.scratchpad_visible(7));
     }
 }

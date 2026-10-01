@@ -11,6 +11,7 @@ mod hook;
 mod hotkey;
 mod layout;
 mod monitor;
+mod status;
 mod tray;
 mod win32;
 mod wm;
@@ -126,6 +127,7 @@ fn run() -> Result<()> {
     // Hand the desktop back: unhide anything parked on an off-screen workspace
     // and restore the geometry every window had before we tiled it.
     wm.reveal_all();
+    wm.publish_stopped();
     println!("[hyprwin] shutting down");
 
     hotkey::unregister_all(&regs);

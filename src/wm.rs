@@ -3,13 +3,17 @@
 //! This is the only module that orchestrates layout, workspace and Win32 calls.
 //! It deliberately contains no rendering or message-loop code.
 
-use crate::config::{Config, Direction, LayoutKind, Rule};
+use crate::config::{size_limit, Config, Direction, LayoutKind, Rule};
 use crate::layout::{self, DwindleTree, Forest, Rect};
 use crate::monitor::{self, Monitor};
+use crate::status::{FocusedStatus, MonitorStatus, Status};
 use crate::win32;
-use crate::workspace::WorkspaceState;
+use crate::workspace::{WorkspaceState, SCRATCHPAD_WORKSPACE};
 use std::collections::HashMap;
 use windows::Win32::Foundation::HWND;
+
+/// Share of the work area the scratchpad covers when it drops down.
+const SCRATCHPAD_FRACTION: f32 = 0.7;
 
 /// A window HyprWin is aware of.
 #[derive(Debug, Clone)]
@@ -40,6 +44,8 @@ pub struct Wm {
     /// id -> rectangle the window had immediately before we first tiled it, so
     /// quitting can hand the desktop back as we found it.
     saved_rects: HashMap<usize, Rect>,
+    /// id -> rectangle from before it became the scratchpad, restored when pulled up.
+    scratch_saves: HashMap<usize, Rect>,
     next_id: usize,
     pub tiling_enabled: bool,
 }
@@ -62,6 +68,7 @@ impl Wm {
             forests: HashMap::new(),
             placed: HashMap::new(),
             saved_rects: HashMap::new(),
+            scratch_saves: HashMap::new(),
             next_id: 1,
             tiling_enabled: true,
         }
@@ -109,9 +116,7 @@ impl Wm {
 
     /// Does an existing rule say to leave this window alone entirely?
     fn rule_ignores(&self, hwnd: HWND) -> bool {
-        let exe = win32::exe_name(hwnd);
-        let class = win32::class_name(hwnd);
-        let title = win32::title(hwnd);
+        let (exe, class, title) = self.rule_fields(hwnd);
         self.cfg
             .rules
             .iter()
@@ -120,9 +125,7 @@ impl Wm {
     }
 
     fn rule_target_workspace(&self, hwnd: HWND) -> Option<u32> {
-        let exe = win32::exe_name(hwnd);
-        let class = win32::class_name(hwnd);
-        let title = win32::title(hwnd);
+        let (exe, class, title) = self.rule_fields(hwnd);
         self.cfg
             .rules
             .iter()
@@ -133,14 +136,61 @@ impl Wm {
     }
 
     fn rule_floats(&self, hwnd: HWND) -> bool {
-        let exe = win32::exe_name(hwnd);
-        let class = win32::class_name(hwnd);
-        let title = win32::title(hwnd);
+        let (exe, class, title) = self.rule_fields(hwnd);
+        let size = win32::rect_of(hwnd).map(|r| (r.w, r.h));
         self.cfg
             .rules
             .iter()
             .filter(|r| r.action == "float")
+            .any(|r| rule_matches(r, &exe, &class, &title) && rule_size_allows(r, size))
+    }
+
+    /// Is the focused window tagged for the scratchpad?
+    fn rule_scratchpads(&self, hwnd: HWND) -> bool {
+        let (exe, class, title) = self.rule_fields(hwnd);
+        self.cfg
+            .rules
+            .iter()
+            .filter(|r| r.action == "scratchpad")
             .any(|r| rule_matches(r, &exe, &class, &title))
+    }
+
+    /// Which monitor a window should live on: a `monitor` rule if one matches,
+    /// otherwise the one it physically overlaps.
+    fn target_monitor(&self, hwnd: HWND, exe: &str, class: &str, title: &str) -> Option<isize> {
+        let named = self
+            .cfg
+            .rules
+            .iter()
+            .filter(|r| r.action == "monitor")
+            .find(|r| rule_matches(r, exe, class, title))
+            .and_then(|r| r.arg.as_deref())
+            .and_then(|a| parse_monitor(a, &self.monitors));
+        named.or_else(|| Some(self.monitor_for(hwnd)))
+    }
+
+    fn rule_fields(&self, hwnd: HWND) -> (String, String, String) {
+        (
+            win32::exe_name(hwnd),
+            win32::class_name(hwnd),
+            win32::title(hwnd),
+        )
+    }
+
+    /// Put a window back into a tile if Windows has maximised it.
+    ///
+    /// A window can be maximised at any time — by a title-bar double click, by
+    /// `Win`+`Up`, or by the application itself — and a maximised window is
+    /// still `IsWindowVisible`, so it stays in the layout. Setting its position
+    /// does not un-maximise it, so without this it would sit zoomed over the
+    /// whole monitor and ignore the tile it was given.
+    fn normalize(&self, id: usize) {
+        if self.workspaces.is_floating(id) {
+            return;
+        }
+        if let Some(hwnd) = self.hwnd_of(id) {
+            win32::unmaximize(hwnd);
+        }
     }
 
     /// Adopt a window. Returns its id, or None if it should not be tiled.
@@ -151,10 +201,17 @@ impl Wm {
         if !win32::is_manageable(hwnd) || self.rule_ignores(hwnd) {
             return None;
         }
-        let mon = self.monitor_for(hwnd);
-        let ws = self
-            .rule_target_workspace(hwnd)
-            .unwrap_or_else(|| self.workspaces.active(mon));
+        let (exe, class, title) = self.rule_fields(hwnd);
+        let mon = self
+            .target_monitor(hwnd, &exe, &class, &title)
+            .unwrap_or(0);
+        let scratch = self.rule_scratchpads(hwnd);
+        let ws = if scratch {
+            SCRATCHPAD_WORKSPACE
+        } else {
+            self.rule_target_workspace(hwnd)
+                .unwrap_or_else(|| self.workspaces.active(mon))
+        };
         let float = self.rule_floats(hwnd);
 
         let id = self.next_id;
@@ -164,7 +221,7 @@ impl Wm {
         if let Some(r) = win32::rect_of(hwnd) {
             self.saved_rects.insert(id, r);
         }
-        self.workspaces.assign(id, ws);
+        self.workspaces.assign_raw(id, ws);
         self.workspaces.set_floating(id, float);
         self.windows.insert(
             id,
@@ -177,9 +234,22 @@ impl Wm {
         );
         self.by_hwnd.insert(key(hwnd), id);
 
+        if scratch {
+            // A scratchpad-tagged window is dropped down the moment it appears,
+            // rather than silently vanishing onto a hidden workspace. The window
+            // must already be in `windows` for these to find it.
+            self.make_scratchpad(id);
+            self.focus_scratchpad(mon);
+            self.workspaces.toggle_scratchpad(mon);
+        }
+
         if !float {
-            // Windows on a non-active workspace stay hidden.
-            if ws != self.workspaces.active(mon) {
+            // Windows on a non-active workspace stay hidden. The scratchpad is
+            // dropped down by the block above, so its window stays visible.
+            if ws != self.workspaces.active(mon)
+                && ws != SCRATCHPAD_WORKSPACE
+                && !self.workspaces.scratchpad_visible(mon)
+            {
                 win32::hide(hwnd);
             }
             win32::unmaximize(hwnd);
@@ -224,6 +294,7 @@ impl Wm {
         self.workspaces.remove(id);
         self.placed.remove(&id);
         self.saved_rects.remove(&id);
+        self.scratch_saves.remove(&id);
         // Drop it from the parked tree of every workspace, not just the active
         // one, or a stale leaf would come back when you next visit that desktop.
         self.forests.entry(mon).or_default().forget(id);
@@ -238,6 +309,7 @@ impl Wm {
         self.workspaces.remove(id);
         self.placed.remove(&id);
         self.saved_rects.remove(&id);
+        self.scratch_saves.remove(&id);
     }
 
     /// Bring `hwnd` to the foreground. Used when the user clicks a window.
@@ -247,7 +319,9 @@ impl Wm {
         };
         let mon = self.windows[&id].monitor;
         let ws = self.workspaces.workspace_of(id);
-        if ws != self.workspaces.active(mon) {
+        // The scratchpad deliberately sits outside the numbered workspaces;
+        // switching to it would be a switch to a number nobody else uses.
+        if ws != SCRATCHPAD_WORKSPACE && ws != self.workspaces.active(mon) {
             self.switch_workspace(mon, ws);
         }
         // The user aimed at one specific window; the workspace switch raises the
@@ -268,6 +342,11 @@ impl Wm {
         if self.workspaces.active(mon) == target {
             return;
         }
+        // The scratchpad covers the middle of the screen; switching desktops
+        // pulls it up rather than leaving it floating over the new one.
+        if self.workspaces.scratchpad_visible(mon) {
+            self.workspaces.toggle_scratchpad(mon);
+        }
         self.workspaces.set_active(mon, target);
         self.retile_monitor(mon);
         self.focus_first_visible(mon);
@@ -276,6 +355,10 @@ impl Wm {
 
     fn ensure_tree(&mut self, mon: isize) {
         let ws = self.workspaces.active(mon);
+        // Only the active workspace's own windows. The scratchpad has its own
+        // tree and must never leak into this one: if it did, the active layout
+        // would treat the scratchpad window as a tile, and the retile that runs
+        // after the drop-down would overwrite its centred rectangle.
         let desired: Vec<usize> = self
             .windows
             .values()
@@ -314,9 +397,15 @@ impl Wm {
 
     fn visible_ids(&self, mon: isize) -> Vec<usize> {
         let ws = self.workspaces.active(mon);
+        let scratch = self.workspaces.scratchpad_visible(mon);
         self.windows
             .values()
-            .filter(|w| w.monitor == mon && self.workspaces.workspace_of(w.id) == ws)
+            .filter(|w| {
+                w.monitor == mon
+                    && (self.workspaces.workspace_of(w.id) == ws
+                        || (scratch
+                            && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE))
+            })
             .map(|w| w.id)
             .collect()
     }
@@ -353,11 +442,47 @@ impl Wm {
             .filter(|w| w.monitor == mon)
             .map(|w| w.id)
             .collect();
+
+        // Un-maximise anything this retile is about to place, so the geometry it
+        // is given is the geometry it keeps.
+        //
+        // Keyed off workspace membership rather than `is_visible`: a window can
+        // be maximised while it is hidden on another workspace, and
+        // `unmaximize` calls `ShowWindow(SW_RESTORE)`, which *shows* the window.
+        // Touching a parked window here would drag it onto the current desktop.
+        let active = self.workspaces.active(mon);
+        let scratch_down = self.workspaces.scratchpad_visible(mon);
+        let to_normalize: Vec<usize> = ids_on_mon
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.windows.get(id).is_some_and(|w| {
+                    if win32::is_minimized(w.hwnd) || self.workspaces.is_floating(*id) {
+                        return false;
+                    }
+                    // The scratchpad window is only in the tree while it is down.
+                    let on = self.workspaces.workspace_of(*id);
+                    if on == SCRATCHPAD_WORKSPACE {
+                        return scratch_down;
+                    }
+                    on == active
+                })
+            })
+            .collect();
+        for id in &to_normalize {
+            self.normalize(*id);
+        }
         for id in ids_on_mon {
             self.placed.remove(&id);
         }
 
-        let active = self.workspaces.active(mon);
+        // The scratchpad drops over the middle of the work area, on top of the
+        // layout, rather than taking part in it: it has its own tree, so
+        // bringing it down and pulling it up never disturbs what is underneath.
+        if scratch_down {
+            self.layout_scratchpad(mon);
+        }
+
         let (go, gi) = (self.cfg.gaps_outer, self.cfg.gaps_inner);
         let kind = self.layout_kind;
         let ratio = self.cfg.master_ratio;
@@ -414,6 +539,32 @@ impl Wm {
 
         self.apply_visibility(mon);
         self.persist_tree(mon, active, &tree);
+        // Every change to the layout funnels through a retile, so this is the one
+        // place the status document needs to be republished.
+        self.publish_status();
+    }
+
+    /// Write the status document if the user asked for one. Failures are logged
+    /// once per write; a dashboard is a convenience, not a reason to stop tiling.
+    pub fn publish_status(&self) {
+        if !self.cfg.status_file {
+            return;
+        }
+        if let Err(e) = crate::status::write(&self.cfg.status_path(), &self.status_document()) {
+            eprintln!("[hyprwin] could not write status file: {e}");
+        }
+    }
+
+    /// Publish a final document that marks the manager as stopped, so a skin
+    /// does not keep showing the last active workspace after HyprWin exits.
+    pub fn publish_stopped(&self) {
+        if !self.cfg.status_file {
+            return;
+        }
+        let mut doc = self.status_document();
+        doc.running = false;
+        doc.tiling_enabled = false;
+        let _ = crate::status::write(&self.cfg.status_path(), &doc);
     }
 
     /// Save the active workspace's tree so its layout survives a switch away.
@@ -429,6 +580,7 @@ impl Wm {
     /// back when its workspace is shown again.
     fn apply_visibility(&mut self, mon: isize) {
         let active = self.workspaces.active(mon);
+        let scratch = self.workspaces.scratchpad_visible(mon);
         let plan: Vec<(HWND, bool)> = self
             .windows
             .values()
@@ -439,7 +591,8 @@ impl Wm {
                 if win32::is_minimized(w.hwnd) {
                     return None;
                 }
-                let should_show = self.workspaces.workspace_of(w.id) == active;
+                let on = self.workspaces.workspace_of(w.id);
+                let should_show = on == active || (scratch && on == SCRATCHPAD_WORKSPACE);
                 let visible = win32::is_visible(w.hwnd);
                 if should_show == visible {
                     None
@@ -457,6 +610,118 @@ impl Wm {
         }
     }
 
+    /// Place the scratchpad windows over the middle of the work area.
+    ///
+    /// The tree is a plain dwindle tree of the scratchpad windows and is laid
+    /// out against this centred rectangle; the result feeds `placed`, so the
+    /// scratchpad windows are also reachable by geometric focus. They stay
+    /// tiled, not floating: `retile_monitor` is the only writer of geometry, so
+    /// leaving them in its tree is what lets any later retile re-assert the
+    /// drop-down rectangle instead of letting a nudge stick.
+    fn layout_scratchpad(&mut self, mon: isize) {
+        let ids: Vec<usize> = self
+            .windows
+            .values()
+            .filter(|w| {
+                w.monitor == mon
+                    && !w.floating
+                    && !self.workspaces.is_fullscreen(w.id)
+                    && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE
+            })
+            .map(|w| w.id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let tree = self
+            .forests
+            .entry(mon)
+            .or_default()
+            .deactivate(SCRATCHPAD_WORKSPACE);
+        let order: Vec<usize> = tree
+            .leaf_ids()
+            .into_iter()
+            .filter(|id| ids.contains(id))
+            .collect();
+        let area = self.work_area(mon);
+        let rect = self.scratchpad_rect(area);
+        let (go, gi) = (self.cfg.gaps_outer, self.cfg.gaps_inner);
+        let rects = layout::compute(self.layout_kind, &tree, &order, rect, self.cfg.master_ratio, go, gi);
+        let mut moves: Vec<(HWND, Rect)> = Vec::new();
+        for (id, r) in rects {
+            if let Some(hwnd) = self.hwnd_of(id) {
+                moves.push((hwnd, r));
+                self.placed.insert(id, r);
+            }
+        }
+        win32::animate_batch(&moves, self.cfg.animation_ms, &self.cfg.animation_easing);
+    }
+
+    /// The centred rectangle the scratchpad occupies inside the work area.
+    fn scratchpad_rect(&self, area: Rect) -> Rect {
+        let w = ((area.w as f32) * SCRATCHPAD_FRACTION).round() as i32;
+        let h = ((area.h as f32) * SCRATCHPAD_FRACTION).round() as i32;
+        let w = w.clamp(1, area.w);
+        let h = h.clamp(1, area.h);
+        Rect::new(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h)
+    }
+
+    /// Drop the scratchpad's window over everything.
+    ///
+    /// It is deliberately *not* marked floating. The scratchpad window is tiled
+    /// like any other window — just against a centred rectangle — so that
+    /// `retile_monitor` remains the single authority on its geometry. Floating
+    /// it would take it out of the tree and out of every retile, which is how a
+    /// stray drag or a workspace switch used to leave it stuck at whatever size
+    /// it happened to be.
+    fn focus_scratchpad(&mut self, mon: isize) {
+        let Some(id) = self.scratchpad_focus(mon) else {
+            return;
+        };
+        let Some(hwnd) = self.hwnd_of(id) else {
+            return;
+        };
+        // Remember the window's own shape so pulling the scratchpad up hands it
+        // back rather than leaving it at the drop-down size.
+        let saved = win32::rect_of(hwnd).unwrap_or(Rect::new(0, 0, 800, 600));
+        self.scratch_saves.insert(id, saved);
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.floating = false;
+        }
+        self.workspaces.set_floating(id, false);
+        win32::unmaximize(hwnd);
+        win32::set_foreground(hwnd);
+    }
+
+    /// Pull the scratchpad window back up: restore its own shape and re-tile it.
+    fn unfocus_scratchpad(&mut self, mon: isize) {
+        let Some(id) = self.scratchpad_focus(mon) else {
+            return;
+        };
+        let Some(hwnd) = self.hwnd_of(id) else {
+            return;
+        };
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.floating = false;
+        }
+        self.workspaces.set_floating(id, false);
+        // The retile that follows hides it, so only the window's own shape has
+        // to be put back here.
+        if let Some(r) = self.scratch_saves.remove(&id) {
+            win32::set_pos(hwnd, r);
+        }
+    }
+
+    /// The scratchpad window to show: an explicit tag wins, then whatever is on
+    /// the scratchpad workspace.
+    fn scratchpad_focus(&self, mon: isize) -> Option<usize> {
+        self.windows
+            .values()
+            .filter(|w| w.monitor == mon && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE)
+            .max_by_key(|w| win32::is_maximized(w.hwnd))
+            .map(|w| w.id)
+    }
+
     /// Show every window HyprWin manages, whatever workspace it sits on, and
     /// hand back the geometry it had before we tiled it.
     ///
@@ -471,7 +736,13 @@ impl Wm {
                 continue;
             }
             win32::clear_border(w.hwnd);
-            if let Some(r) = self.saved_rects.get(&w.id) {
+            // A scratchpad window was floated and blown up; hand back the size
+            // it had, which `saved_rects` does not know about.
+            let saved = self
+                .scratch_saves
+                .get(&w.id)
+                .or_else(|| self.saved_rects.get(&w.id));
+            if let Some(r) = saved {
                 win32::set_pos(w.hwnd, *r);
             }
             if !win32::is_visible(w.hwnd) {
@@ -525,6 +796,19 @@ impl Wm {
         let new = monitor::enumerate();
         self.monitors = new;
         let mons: Vec<isize> = self.monitors.iter().map(|m| m.handle).collect();
+        let stale: Vec<isize> = self
+            .workspaces
+            .known_monitors()
+            .into_iter()
+            .filter(|m| !mons.contains(m))
+            .collect();
+        for mon in stale {
+            // A monitor that went away takes its active workspace, its parked
+            // trees and its scratchpad state with it, or the memory would grow
+            // on every hot-plug and the status output would report ghosts.
+            self.workspaces.forget_monitor(mon);
+            self.forests.remove(&mon);
+        }
         let pairs: Vec<(usize, isize)> = self
             .windows
             .values()
@@ -536,6 +820,65 @@ impl Wm {
             }
         }
         self.retile_all();
+    }
+
+    // ---------------------------------------------------------------- status
+
+    /// Snapshot the state an external dashboard needs.
+    ///
+    /// The document is rebuilt from scratch every time rather than patched, so a
+    /// workspace that empties out or a window that closes cannot leave stale
+    /// counts behind for a skin to display.
+    pub fn status_document(&self) -> Status {
+        let focused = win32::foreground();
+        let focused_id = self.id_of(focused);
+        let layout = layout_name(self.layout_kind).to_string();
+        let monitors = self
+            .monitors
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let ws = self.workspaces.active(m.handle);
+                MonitorStatus {
+                    index: i + 1,
+                    primary: m.primary,
+                    active_workspace: ws,
+                    layout: layout.clone(),
+                    windows: self
+                        .windows
+                        .values()
+                        .filter(|w| {
+                            w.monitor == m.handle && self.workspaces.workspace_of(w.id) == ws
+                        })
+                        .count(),
+                    scratchpad: self.workspaces.scratchpad_visible(m.handle),
+                    scratchpad_windows: self
+                        .windows
+                        .values()
+                        .filter(|w| {
+                            w.monitor == m.handle
+                                && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE
+                        })
+                        .count(),
+                    work_area: m.work.into(),
+                }
+            })
+            .collect();
+        Status {
+            running: true,
+            pid: std::process::id(),
+            tiling_enabled: self.tiling_enabled,
+            focused: FocusedStatus {
+                title: focused_id.map(|_| win32::title(focused)).unwrap_or_default(),
+                exe: focused_id.map(|_| win32::exe_name(focused)).unwrap_or_default(),
+                monitor: focused_id
+                    .and_then(|id| self.windows.get(&id).map(|w| w.monitor))
+                    .and_then(|mon| self.monitors.iter().position(|m| m.handle == mon))
+                    .map(|i| i + 1)
+                    .unwrap_or(0),
+            },
+            monitors,
+        }
     }
 
     // ---------------------------------------------------------------- borders
@@ -572,6 +915,9 @@ impl Wm {
             "togglelayout" => self.cmd_toggle_layout(),
             "workspace" => self.cmd_workspace(arg),
             "movetoworkspace" => self.cmd_move_to_workspace(arg),
+            "movetomonitor" => self.cmd_move_to_monitor(arg),
+            "scratchpad" => self.cmd_scratchpad(),
+            "movetoscratchpad" => self.cmd_move_to_scratchpad(),
             "close" => self.cmd_close(),
             "reload" => self.cmd_reload(),
             other => eprintln!("[hyprwin] unknown action '{other}'"),
@@ -594,19 +940,28 @@ impl Wm {
         if self.workspaces.is_fullscreen(focus) && !swap {
             return;
         }
+        // While the scratchpad is down, its window is part of what the user can
+        // see and point at, so it joins the neighbour search. A swap across the
+        // two trees would be meaningless (they are laid out independently), so
+        // it only happens within one workspace.
         let rects: Vec<(usize, Rect)> = {
             let ws = self.workspaces.active(mon);
+            let scratch = self.workspaces.scratchpad_visible(mon);
             self.placed
                 .iter()
-                .filter(|(id, _)| self.workspaces.workspace_of(**id) == ws)
+                .filter(|(id, _)| {
+                    let on = self.workspaces.workspace_of(**id);
+                    on == ws || (scratch && on == SCRATCHPAD_WORKSPACE)
+                })
                 .map(|(id, r)| (*id, *r))
                 .collect()
         };
         let Some(target) = layout::neighbor(&rects, focus, dir) else {
             return;
         };
-        if swap {
-            let active = self.workspaces.active(mon);
+        let same_workspace = self.workspaces.workspace_of(focus) == self.workspaces.workspace_of(target);
+        if swap && same_workspace && !self.workspaces.is_floating(target) {
+            let active = self.workspaces.workspace_of(focus);
             let forest = self.forests.entry(mon).or_default();
             let mut tree = forest.deactivate(active);
             tree.swap(focus, target);
@@ -631,7 +986,9 @@ impl Wm {
             Direction::Left | Direction::Up => -0.04,
             Direction::Right | Direction::Down => 0.04,
         };
-        let active = self.workspaces.active(mon);
+        // Resize the split in whichever tree the window actually lives in: the
+        // active workspace's, or the scratchpad's while it is down.
+        let active = self.workspaces.workspace_of(focus);
         let forest = self.forests.entry(mon).or_default();
         let mut tree = forest.deactivate(active);
         tree.resize(focus, delta);
@@ -730,6 +1087,125 @@ impl Wm {
         self.switch_workspace(mon, ws);
     }
 
+    /// Move the focused window to another monitor.
+    ///
+    /// Workspace numbers are per-monitor and the target's active workspace has no
+    /// reason to match the source's, so the window is reassigned to whatever the
+    /// target is showing. That is the only assignment that keeps it visible: any
+    /// other number would hide it the moment it arrives.
+    fn cmd_move_to_monitor(&mut self, arg: Option<&str>) {
+        let Some(focus) = self.focused() else {
+            return;
+        };
+        let from = self.windows[&focus].monitor;
+        let Some(to) = self.monitor_step(from, arg.unwrap_or("next")) else {
+            return;
+        };
+        if to == from {
+            return;
+        }
+        let ws = self.workspaces.active(to);
+        self.workspaces.assign(focus, ws);
+        self.forests.entry(from).or_default().forget(focus);
+        if let Some(w) = self.windows.get_mut(&focus) {
+            w.monitor = to;
+            w.floating = false;
+        }
+        self.workspaces.set_floating(focus, false);
+        if let Some(hwnd) = self.hwnd_of(focus) {
+            win32::unmaximize(hwnd);
+        }
+        self.retile_monitor(from);
+        self.retile_monitor(to);
+        if let Some(hwnd) = self.hwnd_of(focus) {
+            win32::set_foreground(hwnd);
+        }
+        self.apply_border_focus();
+    }
+
+    /// The scratchpad toggle: drop its window over everything, or pull it away.
+    ///
+    /// Deliberately explicit: it never picks a window for you. `movetoscratchpad`
+    /// is the way to put something on the scratchpad, so this chord always means
+    /// the same thing whatever is focused. With nothing on the scratchpad it sets
+    /// the flag and shows nothing, which is exactly what Hyprland does.
+    fn cmd_scratchpad(&mut self) {
+        let mon = self
+            .focused()
+            .map(|id| self.windows[&id].monitor)
+            .or_else(|| self.monitors.first().map(|m| m.handle))
+            .unwrap_or(0);
+        let down = self.workspaces.toggle_scratchpad(mon);
+        if down {
+            self.focus_scratchpad(mon);
+        } else {
+            self.unfocus_scratchpad(mon);
+        }
+        self.retile_monitor(mon);
+        self.apply_border_focus();
+    }
+
+    /// Move the focused window onto the scratchpad and drop it down.
+    fn cmd_move_to_scratchpad(&mut self) {
+        let Some(focus) = self.focused() else {
+            return;
+        };
+        let mon = self.windows[&focus].monitor;
+        self.make_scratchpad(focus);
+        if !self.workspaces.scratchpad_visible(mon) {
+            self.workspaces.toggle_scratchpad(mon);
+        }
+        // Make sure the window's shape is remembered before the retile blows it
+        // up, so pulling the scratchpad up can hand it back.
+        if !self.scratch_saves.contains_key(&focus) {
+            if let Some(hwnd) = self.hwnd_of(focus) {
+                if let Some(r) = win32::rect_of(hwnd) {
+                    self.scratch_saves.insert(focus, r);
+                }
+            }
+        }
+        self.retile_monitor(mon);
+        self.apply_border_focus();
+    }
+
+    /// Retag a window as the scratchpad's and put it in the scratchpad's tree.
+    ///
+    /// This does the tree placement rather than leaving it to `ensure_tree`,
+    /// because the retile reconciles the active workspace's tree and never looks
+    /// at a parked one: a window whose *assignment* changed but which is sitting
+    /// in the active workspace's tree would otherwise be pruned out of that tree
+    /// and never inserted anywhere.
+    fn make_scratchpad(&mut self, id: usize) {
+        let mon = self.windows[&id].monitor;
+        self.workspaces.assign_raw(id, SCRATCHPAD_WORKSPACE);
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.floating = false;
+        }
+        self.workspaces.set_floating(id, false);
+        // Drop it from the active workspace's tree, then place it in the
+        // scratchpad's own tree. `forget` covers every parked tree too.
+        self.forests.entry(mon).or_default().forget(id);
+        let forest = self.forests.entry(mon).or_default();
+        let mut tree = forest.deactivate(SCRATCHPAD_WORKSPACE);
+        tree.insert(id, None);
+        forest.activate(&tree, SCRATCHPAD_WORKSPACE);
+    }
+
+    /// A monitor by relative position or index: "next", "prev", or "1".."N".
+    fn monitor_step(&self, from: isize, arg: &str) -> Option<isize> {
+        parse_monitor(arg, &self.monitors).or_else(|| {
+            let handles: Vec<isize> = self.monitors.iter().map(|m| m.handle).collect();
+            let i = handles.iter().position(|h| *h == from)?;
+            let n = handles.len();
+            let next = match arg {
+                "next" => (i + 1) % n.max(1),
+                "prev" => (i + n - 1) % n.max(1),
+                _ => return None,
+            };
+            handles.get(next).copied()
+        })
+    }
+
     fn cmd_close(&mut self) {
         if let Some(focus) = self.focused() {
             if let Some(hwnd) = self.hwnd_of(focus) {
@@ -784,6 +1260,43 @@ fn rule_matches(rule: &Rule, exe: &str, class: &str, title: &str) -> bool {
         }
     };
     check(&rule.exe, exe) && check(&rule.class, class) && check(&rule.title, title)
+}
+
+/// Apply a float rule's `WxH` size limit.
+///
+/// A float rule with no `arg` floats unconditionally (the explicit
+/// "Taskmgr.exe floats" case). A rule with an `arg` is a *size threshold*: it
+/// floats only windows smaller than that, so one rule can float every tool
+/// palette on the desktop without touching normal windows.
+fn rule_size_allows(rule: &Rule, size: Option<(i32, i32)>) -> bool {
+    match rule.arg.as_deref().map(str::trim) {
+        None | Some("") => true,
+        Some(arg) => match (size_limit(arg), size) {
+            (Some((lw, lh)), Some((w, h))) => w < lw && h < lh,
+            // No size to compare (a window we cannot measure) means no match.
+            _ => false,
+        },
+    }
+}
+
+/// A monitor named by index (`"1"`..`"N"`, primary-first) or `"primary"`.
+fn parse_monitor(arg: &str, monitors: &[Monitor]) -> Option<isize> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "primary" | "main" => monitors.iter().find(|m| m.primary).map(|m| m.handle),
+        n => n
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| monitors.get(i))
+            .map(|m| m.handle),
+    }
+}
+
+fn layout_name(kind: LayoutKind) -> &'static str {
+    match kind {
+        LayoutKind::Dwindle => "dwindle",
+        LayoutKind::Master => "master",
+    }
 }
 
 /// Convenience for `Direction` parsing used by tests.
