@@ -769,12 +769,27 @@ impl Wm {
     /// looking at, and if the process simply exits they would stay hidden with no
     /// tray icon left to bring them back. Windows that are minimized are left
     /// alone for the same reason `apply_visibility` skips them.
+    ///
+    /// It also un-maximizes, because a window that was maximized while managed
+    /// is otherwise left zoomed over the whole monitor: restoring its rectangle
+    /// alone does not clear the maximized state.
     pub fn reveal_all(&mut self) {
         for w in self.windows.values() {
             if win32::is_minimized(w.hwnd) {
                 continue;
             }
             win32::clear_border(w.hwnd);
+            // Un-maximize *before* restoring geometry, and never after.
+            //
+            // A window maximized while we managed it is still zoomed, and
+            // `unmaximize` restores it to the size Windows remembers — not to
+            // the geometry we saved. For a window that arrived already maximized,
+            // `saved_rects` holds the *maximized* rect, because it is captured at
+            // adoption before the first un-maximize. So placing first would only
+            // be undone by the restore that followed it. Un-maximizing first also
+            // means the placement afterwards is the last word, which is what the
+            // caller wants.
+            win32::unmaximize(w.hwnd);
             // A scratchpad window was floated and blown up; hand back the size
             // it had, which `saved_rects` does not know about.
             let saved = self
