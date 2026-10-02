@@ -4,10 +4,11 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Tiling layout algorithm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LayoutKind {
     /// Recursive halving; a new window splits the focused one.
+    #[default]
     Dwindle,
     /// One master pane on the left, the rest stacked on the right.
     Master,
@@ -19,12 +20,6 @@ pub enum LayoutKind {
     Grid,
     /// Every window fills the work area; the focused one is on top.
     Stacking,
-}
-
-impl Default for LayoutKind {
-    fn default() -> Self {
-        LayoutKind::Dwindle
-    }
 }
 
 impl LayoutKind {
@@ -362,8 +357,8 @@ impl Config {
     pub fn load_or_create() -> Result<Self> {
         let path = Self::path();
         if path.exists() {
-            let text = fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
             let cfg: Config = serde_json::from_str(&text)
                 .with_context(|| format!("parsing {}", path.display()))?;
             cfg.validate()?;
@@ -401,10 +396,7 @@ impl Config {
             self.master_ratio > 0.1 && self.master_ratio < 0.9,
             "master_ratio must be between 0.1 and 0.9"
         );
-        anyhow::ensure!(
-            self.master_count >= 1,
-            "master_count must be at least 1"
-        );
+        anyhow::ensure!(self.master_count >= 1, "master_count must be at least 1");
         for key in self.layouts.keys() {
             anyhow::ensure!(
                 key.trim().parse::<usize>().map(|n| n >= 1).unwrap_or(false),
@@ -496,12 +488,7 @@ pub fn parse_rgba(s: &str) -> (u8, u8, u8, u8) {
     let t = s.trim().trim_start_matches('#').trim_start_matches("0x");
     let v = u32::from_str_radix(t, 16).unwrap_or(0);
     if t.len() >= 8 {
-        (
-            (v >> 16) as u8,
-            (v >> 8) as u8,
-            v as u8,
-            (v >> 24) as u8,
-        )
+        ((v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8)
     } else {
         ((v >> 16) as u8, (v >> 8) as u8, v as u8, 0xFF)
     }
@@ -528,20 +515,26 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
-        Config::default().validate().expect("defaults must validate");
+        Config::default()
+            .validate()
+            .expect("defaults must validate");
     }
 
     #[test]
     fn main_mod_canonicalises_super() {
-        let mut c = Config::default();
-        c.main_mod = "Super".to_string();
+        let c = Config {
+            main_mod: "Super".to_string(),
+            ..Default::default()
+        };
         assert_eq!(c.main_mod_token(), "win");
     }
 
     #[test]
     fn rejects_insane_master_ratio() {
-        let mut c = Config::default();
-        c.master_ratio = 0.95;
+        let c = Config {
+            master_ratio: 0.95,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
@@ -553,7 +546,10 @@ mod tests {
         assert!(c.validate().is_ok());
         // Its key must be a workspace number, and its value within the range.
         c.master_ratios.insert("left".to_string(), 0.5);
-        assert!(c.validate().is_err(), "a non-numeric workspace key is rejected");
+        assert!(
+            c.validate().is_err(),
+            "a non-numeric workspace key is rejected"
+        );
         c.master_ratios.remove("left");
         c.master_ratios.insert("3".to_string(), 0.99);
         assert!(c.validate().is_err(), "an out-of-range ratio is rejected");
@@ -595,19 +591,26 @@ mod tests {
 
     #[test]
     fn a_bad_log_level_is_rejected_but_off_is_allowed() {
-        let mut c = Config::default();
-        c.log_level = "verbose".to_string();
+        let mut c = Config {
+            log_level: "verbose".to_string(),
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
         c.log_level = "off".to_string();
-        assert!(c.validate().is_ok(), "`off` is a deliberate choice, not a typo");
+        assert!(
+            c.validate().is_ok(),
+            "`off` is a deliberate choice, not a typo"
+        );
     }
 
     #[test]
     fn the_log_path_defaults_next_to_the_config() {
         let c = Config::default();
         assert_eq!(c.log_path(), Config::dir().join("hyprwin.log"));
-        let mut c = Config::default();
-        c.log_path = "D:\\logs\\hyprwin.log".to_string();
+        let c = Config {
+            log_path: "D:\\logs\\hyprwin.log".to_string(),
+            ..Default::default()
+        };
         assert_eq!(c.log_path(), PathBuf::from("D:\\logs\\hyprwin.log"));
     }
 
@@ -658,12 +661,14 @@ mod tests {
 
     #[test]
     fn a_malformed_float_rule_arg_is_rejected() {
-        let mut c = Config::default();
-        c.rules = vec![Rule {
-            action: "float".to_string(),
-            arg: Some("not-a-size".to_string()),
+        let c = Config {
+            rules: vec![Rule {
+                action: "float".to_string(),
+                arg: Some("not-a-size".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         assert!(c.validate().is_err());
     }
 
@@ -671,8 +676,10 @@ mod tests {
     fn the_status_path_defaults_next_to_the_config() {
         let c = Config::default();
         assert_eq!(c.status_path(), Config::dir().join("status.json"));
-        let mut c = Config::default();
-        c.status_path = "D:\\skins\\hyprwin.json".to_string();
+        let c = Config {
+            status_path: "D:\\skins\\hyprwin.json".to_string(),
+            ..Default::default()
+        };
         assert_eq!(c.status_path(), PathBuf::from("D:\\skins\\hyprwin.json"));
     }
 

@@ -52,8 +52,12 @@ impl Wm {
             pid: std::process::id(),
             tiling_enabled: self.tiling_enabled,
             focused: FocusedStatus {
-                title: focused_id.map(|_| win32::title(focused)).unwrap_or_default(),
-                exe: focused_id.map(|_| win32::exe_name(focused)).unwrap_or_default(),
+                title: focused_id
+                    .map(|_| win32::title(focused))
+                    .unwrap_or_default(),
+                exe: focused_id
+                    .map(|_| win32::exe_name(focused))
+                    .unwrap_or_default(),
                 monitor: focused_id
                     .and_then(|id| self.windows.get(&id).map(|w| w.monitor))
                     .and_then(|mon| self.monitors.iter().position(|m| m.handle == mon))

@@ -70,12 +70,7 @@ impl Wm {
             };
             frames.push(crate::overlay::Frame {
                 monitor: w.monitor,
-                local: Rect::new(
-                    rect.x - mon.rect.x,
-                    rect.y - mon.rect.y,
-                    rect.w,
-                    rect.h,
-                ),
+                local: Rect::new(rect.x - mon.rect.x, rect.y - mon.rect.y, rect.w, rect.h),
                 width,
                 radius,
                 color_a: if focused { a } else { inactive },

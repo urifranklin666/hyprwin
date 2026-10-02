@@ -113,9 +113,7 @@ impl<'a> DesktopGuard<'a> {
 impl Drop for DesktopGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            crate::log_warn!(
-                "[hyprwin] exiting without a clean shutdown; restoring the desktop"
-            );
+            crate::log_warn!("[hyprwin] exiting without a clean shutdown; restoring the desktop");
             self.wm.reveal_all();
             self.wm.publish_stopped();
         }
@@ -170,7 +168,9 @@ fn run() -> Result<()> {
 
     let hooks = hook::Hooks::install();
     if hooks.count() == 0 {
-        crate::log_warn!("[hyprwin] no WinEvent hooks installed; tiling will not track new windows");
+        crate::log_warn!(
+            "[hyprwin] no WinEvent hooks installed; tiling will not track new windows"
+        );
     } else {
         crate::log_info!("[hyprwin] {} event hooks installed", hooks.count());
     }

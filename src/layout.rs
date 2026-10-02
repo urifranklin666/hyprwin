@@ -85,7 +85,9 @@ impl Rect {
 /// rest of the layout and windows do not jump when another window closes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
-    Leaf { id: usize },
+    Leaf {
+        id: usize,
+    },
     Split {
         horizontal: bool,
         ratio: f32,
@@ -354,7 +356,12 @@ impl DwindleTree {
     /// It reuses the tree's stored ratios but ignores its stored `horizontal`
     /// flags: the same tree therefore feeds both `dwindle` and `spiral`, and
     /// switching between them does not reshape the split sizes.
-    pub fn layout_spiral(&self, area: Rect, gaps_outer: i32, gaps_inner: i32) -> Vec<(usize, Rect)> {
+    pub fn layout_spiral(
+        &self,
+        area: Rect,
+        gaps_outer: i32,
+        gaps_inner: i32,
+    ) -> Vec<(usize, Rect)> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
             Self::walk_spiral(root, area.inset(gaps_outer, gaps_outer), &mut out);
@@ -455,14 +462,14 @@ pub fn tile_master(
         let (master_area, stack) = inner.split_h(ratio);
         // Stack the masters down the first column; a lone master fills it.
         let master_h = master_area.h as f32 / masters as f32;
-        for i in 0..masters {
+        for (i, id) in ids.iter().take(masters).enumerate() {
             let y = master_area.y + (master_h * i as f32).round() as i32;
             let hh = if i == masters - 1 {
                 master_area.bottom() - y
             } else {
                 master_h.round() as i32
             };
-            out.push((ids[i], Rect::new(master_area.x, y, master_area.w, hh.max(1))));
+            out.push((*id, Rect::new(master_area.x, y, master_area.w, hh.max(1))));
         }
         let n = ids.len() - masters;
         let h = stack.h as f32 / n as f32;
@@ -576,6 +583,9 @@ pub fn tile_stacking(ids: &[usize], area: Rect, gaps_outer: i32) -> Vec<(usize, 
 /// `order` is the master/stack order for `master`; the dwindle tree supplies
 /// every other arrangement. `masters` is `master_count` and is ignored by the
 /// other kinds.
+// The parameters are the whole tiling context; bundling them into a struct for
+// one dispatcher would only move the same fields somewhere else.
+#[allow(clippy::too_many_arguments)]
 pub fn compute(
     kind: LayoutKind,
     tree: &DwindleTree,
@@ -835,12 +845,16 @@ mod tests {
         );
         let one_during = during.iter().find(|(i, _)| *i == 1).unwrap().1;
         assert_eq!(
-            one_during, Rect::new(0, 0, 960, 1080),
+            one_during,
+            Rect::new(0, 0, 960, 1080),
             "window 1 keeps its column while 3 reflows within the other"
         );
 
         let after = t.layout(FULL, 0, 0);
-        assert_eq!(after, before, "restoring must reproduce the original layout");
+        assert_eq!(
+            after, before,
+            "restoring must reproduce the original layout"
+        );
     }
 
     #[test]
@@ -867,7 +881,11 @@ mod tests {
         // ...while the inner split grew window 3's share at window 2's expense.
         assert!(by_id(3).h > 540, "the resized window grows");
         assert!(by_id(2).h < 540, "its sibling gives up the space");
-        assert_eq!(by_id(2).h + by_id(3).h, 1080, "the split still fills the area");
+        assert_eq!(
+            by_id(2).h + by_id(3).h,
+            1080,
+            "the split still fills the area"
+        );
     }
 
     #[test]
@@ -995,9 +1013,7 @@ mod tests {
         t.insert(1, None);
         t.insert(2, Some(1));
         t.insert(3, Some(2));
-        let by_id = |r: Vec<(usize, Rect)>, id: usize| {
-            r.iter().find(|(i, _)| *i == id).unwrap().1
-        };
+        let by_id = |r: Vec<(usize, Rect)>, id: usize| r.iter().find(|(i, _)| *i == id).unwrap().1;
         let dwindle = t.layout(FULL, 0, 0);
         let spiral = t.layout_spiral(FULL, 0, 0);
         assert_eq!(by_id(dwindle.clone(), 2), Rect::new(960, 0, 960, 540));
@@ -1099,11 +1115,17 @@ mod tests {
         let mut forest = Forest::default();
         forest.activate(&t, 1);
         let restored = forest.deactivate(1);
-        assert_eq!(restored.root, t.root, "ws 1 must come back exactly as it was");
+        assert_eq!(
+            restored.root, t.root,
+            "ws 1 must come back exactly as it was"
+        );
 
         let rects = restored.layout(FULL, 0, 0);
         let one = rects.iter().find(|(i, _)| *i == 1).unwrap().1;
-        assert_eq!(one.w, 960, "the preserved split ratio survives the round trip");
+        assert_eq!(
+            one.w, 960,
+            "the preserved split ratio survives the round trip"
+        );
     }
 
     #[test]
@@ -1130,7 +1152,10 @@ mod tests {
         t.insert(1, None);
         forest.activate(&t, 2);
         assert!(forest.deactivate(5).is_empty());
-        assert!(forest.deactivate(0).is_empty(), "workspace 0 must not panic");
+        assert!(
+            forest.deactivate(0).is_empty(),
+            "workspace 0 must not panic"
+        );
     }
 
     #[test]

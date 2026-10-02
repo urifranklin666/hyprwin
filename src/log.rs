@@ -109,7 +109,9 @@ pub fn set_level(level: Option<Level>) {
 
 /// Move an oversized log aside, keeping exactly one previous file.
 fn rotate(path: &Path) {
-    let too_big = fs::metadata(path).map(|m| m.len() > MAX_BYTES).unwrap_or(false);
+    let too_big = fs::metadata(path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false);
     if !too_big {
         return;
     }
@@ -191,10 +193,18 @@ mod tests {
 
     #[test]
     fn levels_parse_and_off_is_distinct_from_unknown() {
-        assert_eq!(Level::parse("off"), Some(None), "off is valid and means silent");
+        assert_eq!(
+            Level::parse("off"),
+            Some(None),
+            "off is valid and means silent"
+        );
         assert_eq!(Level::parse("  DEBUG "), Some(Some(Level::Debug)));
         assert_eq!(Level::parse("warn"), Some(Some(Level::Warn)));
-        assert_eq!(Level::parse("banana"), None, "an unknown level is not `off`");
+        assert_eq!(
+            Level::parse("banana"),
+            None,
+            "an unknown level is not `off`"
+        );
     }
 
     #[test]
@@ -217,7 +227,10 @@ mod tests {
 
         rotate(&path);
         assert!(!path.exists(), "the oversized log is moved aside");
-        assert!(dir.join("hyprwin.log.old").exists(), "the previous log is kept");
+        assert!(
+            dir.join("hyprwin.log.old").exists(),
+            "the previous log is kept"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

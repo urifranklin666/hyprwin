@@ -41,7 +41,11 @@ impl Wm {
         self.tiling_enabled = !self.tiling_enabled;
         crate::log_info!(
             "[hyprwin] tiling {}",
-            if self.tiling_enabled { "enabled" } else { "disabled" }
+            if self.tiling_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
         if self.tiling_enabled {
             self.retile_all();
@@ -139,7 +143,11 @@ impl Wm {
             out.push_str(&format!(
                 "monitor {} {} work area {}x{}+{}+{} workspace {} {} windows {}{}\n",
                 i + 1,
-                if m.primary { "(primary)" } else { "(secondary)" },
+                if m.primary {
+                    "(primary)"
+                } else {
+                    "(secondary)"
+                },
                 m.work.w,
                 m.work.h,
                 m.work.x,
@@ -209,7 +217,8 @@ impl Wm {
         let Some(target) = layout::neighbor(&rects, focus, dir) else {
             return;
         };
-        let same_workspace = self.workspaces.workspace_of(focus) == self.workspaces.workspace_of(target);
+        let same_workspace =
+            self.workspaces.workspace_of(focus) == self.workspaces.workspace_of(target);
         if swap && same_workspace && !self.workspaces.is_floating(target) {
             let active = self.workspaces.workspace_of(focus);
             let forest = self.forests.entry(mon).or_default();
@@ -253,12 +262,7 @@ impl Wm {
                 let cur = win32::rect_of(hwnd).unwrap_or(Rect::new(0, 0, 800, 600));
                 let w = cur.w.clamp(320, area.w);
                 let h = cur.h.clamp(240, area.h);
-                let rect = Rect::new(
-                    area.x + (area.w - w) / 2,
-                    area.y + (area.h - h) / 2,
-                    w,
-                    h,
-                );
+                let rect = Rect::new(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h);
                 win32::clear_border(hwnd);
                 self.animate_into_tween(&[(hwnd, rect)]);
             }
@@ -515,4 +519,3 @@ impl Wm {
         self.apply_border_focus();
     }
 }
-

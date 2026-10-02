@@ -14,11 +14,11 @@ use std::os::windows::io::FromRawHandle;
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
-};
 use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
 
 /// The snapshot shared with the main loop, once `spawn` has been called.
 static SHARED: OnceLock<Arc<Mutex<Control>>> = OnceLock::new();
@@ -52,7 +52,6 @@ impl Default for Control {
 /// The reply to a request is carried by `events::ControlCommand`, which owns the
 /// channel it travels back on. `status`/`monitors` are answered by the shared
 /// snapshot instead, without waking the main loop.
-
 pub fn full_pipe_path() -> String {
     format!(r"\\.\pipe\{PIPE_NAME}")
 }
@@ -90,8 +89,8 @@ fn listen(path: String, control: Arc<Mutex<Control>>) {
                 PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
-                0, // output buffer: let the system pick
-                0, // input buffer
+                0,                    // output buffer: let the system pick
+                0,                    // input buffer
                 protocol::TIMEOUT_MS, // busy timeout, so a stuck client is dropped
                 None,
             )
@@ -122,8 +121,11 @@ fn serve(handle: HANDLE, control: &Arc<Mutex<Control>>) {
             Ok(0) => break,
             Ok(n) => {
                 if request.len() + n > MAX_REQUEST {
-                    let _ =
-                        stream.write_all(Response::Err("request too large".into()).render().as_bytes());
+                    let _ = stream.write_all(
+                        Response::Err("request too large".into())
+                            .render()
+                            .as_bytes(),
+                    );
                     break;
                 }
                 request.push_str(&String::from_utf8_lossy(&buf[..n]));
@@ -162,7 +164,9 @@ fn handle_request(line: &str, control: &Arc<Mutex<Control>>) -> Response {
                 arg,
                 reply: tx,
             }));
-            match rx.recv_timeout(std::time::Duration::from_millis(protocol::TIMEOUT_MS as u64)) {
+            match rx.recv_timeout(std::time::Duration::from_millis(
+                protocol::TIMEOUT_MS as u64,
+            )) {
                 Ok(message) => message,
                 Err(_) => Response::Err("HyprWin did not answer".to_string()),
             }
@@ -174,7 +178,9 @@ fn handle_request(line: &str, control: &Arc<Mutex<Control>>) -> Response {
                 arg: None,
                 reply: tx,
             }));
-            match rx.recv_timeout(std::time::Duration::from_millis(protocol::TIMEOUT_MS as u64)) {
+            match rx.recv_timeout(std::time::Duration::from_millis(
+                protocol::TIMEOUT_MS as u64,
+            )) {
                 Ok(_) => Response::Ok("shutting down".to_string()),
                 Err(_) => Response::Ok("shutting down".to_string()),
             }

@@ -112,11 +112,7 @@ impl Tween {
         };
         // The final frame lands exactly on the target; easing towards 1.0 leaves
         // a sub-pixel remainder that rounding could otherwise keep.
-        let eased = if finished {
-            1.0
-        } else {
-            ease(&self.easing, t)
-        };
+        let eased = if finished { 1.0 } else { ease(&self.easing, t) };
         let frames = self
             .items
             .iter()
@@ -232,7 +228,11 @@ mod tests {
         let mut t = tween(100);
         // A second retile arrives mid-flight for the same window from wherever it
         // now is to a new place; the item is updated, not duplicated.
-        t.merge(vec![(7, Rect::new(120, 0, 100, 100), Rect::new(400, 0, 100, 100))]);
+        t.merge(vec![(
+            7,
+            Rect::new(120, 0, 100, 100),
+            Rect::new(400, 0, 100, 100),
+        )]);
         assert_eq!(t.sample_at(0).0.len(), 1);
         let (frames, _) = t.sample_at(100);
         assert_eq!(frames[0].1.x, 400);

@@ -167,8 +167,7 @@ impl Wm {
         let duration = self.cfg.animation_ms;
         if duration == 0 {
             self.tween = None;
-            let pairs: Vec<(isize, Rect)> =
-                moves.iter().map(|(h, r)| (key(*h), *r)).collect();
+            let pairs: Vec<(isize, Rect)> = moves.iter().map(|(h, r)| (key(*h), *r)).collect();
             win32::set_pos_tween(&pairs);
             return;
         }
@@ -285,7 +284,12 @@ impl Wm {
             let best = self
                 .monitors
                 .iter()
-                .map(|m| (r.overlap_h(&m.work) as i64 * r.overlap_v(&m.work) as i64, m.handle))
+                .map(|m| {
+                    (
+                        r.overlap_h(&m.work) as i64 * r.overlap_v(&m.work) as i64,
+                        m.handle,
+                    )
+                })
                 .filter(|(area, _)| *area > 0)
                 .max_by_key(|(area, _)| *area);
             if let Some((_, handle)) = best {
@@ -386,9 +390,7 @@ impl Wm {
             return None;
         }
         let (exe, class, title) = self.rule_fields(hwnd);
-        let mon = self
-            .target_monitor(hwnd, &exe, &class, &title)
-            .unwrap_or(0);
+        let mon = self.target_monitor(hwnd, &exe, &class, &title).unwrap_or(0);
         let scratch = self.rule_scratchpads(hwnd);
         let ws = if scratch {
             SCRATCHPAD_WORKSPACE
@@ -518,11 +520,7 @@ impl Wm {
             return;
         };
         let monitor = self.windows.get(&id).map(|w| w.monitor).unwrap_or(0);
-        self.drag = Some(DragState {
-            id,
-            start,
-            monitor,
-        });
+        self.drag = Some(DragState { id, start, monitor });
     }
 
     /// Interpret a finished move/resize gesture as a layout operation.
@@ -570,12 +568,20 @@ impl Wm {
         let dh = end.h - drag.start.h;
         if moved <= 24 {
             if dw.abs() >= dh.abs() && dw.abs() >= 8 {
-                let dir = if dw > 0 { Direction::Right } else { Direction::Left };
+                let dir = if dw > 0 {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                };
                 self.resize_focused_edge(id, dir);
                 return;
             }
             if dh.abs() > dw.abs() && dh.abs() >= 8 {
-                let dir = if dh > 0 { Direction::Down } else { Direction::Up };
+                let dir = if dh > 0 {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                };
                 self.resize_focused_edge(id, dir);
                 return;
             }
@@ -600,10 +606,7 @@ impl Wm {
         self.monitors
             .iter()
             .find(|m| {
-                x >= m.rect.x
-                    && x < m.rect.x + m.rect.w
-                    && y >= m.rect.y
-                    && y < m.rect.y + m.rect.h
+                x >= m.rect.x && x < m.rect.x + m.rect.w && y >= m.rect.y && y < m.rect.y + m.rect.h
             })
             .map(|m| m.handle)
     }
@@ -616,11 +619,7 @@ impl Wm {
             if *other == id {
                 continue;
             }
-            if point.0 >= r.x
-                && point.0 < r.x + r.w
-                && point.1 >= r.y
-                && point.1 < r.y + r.h
-            {
+            if point.0 >= r.x && point.0 < r.x + r.w && point.1 >= r.y && point.1 < r.y + r.h {
                 let area = r.w as i64 * r.h as i64;
                 if best.map(|(a, _)| area < a).unwrap_or(true) {
                     best = Some((area, *other));
@@ -803,8 +802,7 @@ impl Wm {
             .filter(|w| {
                 w.monitor == mon
                     && (self.workspaces.workspace_of(w.id) == ws
-                        || (scratch
-                            && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE))
+                        || (scratch && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE))
             })
             .map(|w| w.id)
             .collect()
@@ -915,9 +913,7 @@ impl Wm {
         let tiled: Vec<usize> = visible
             .iter()
             .copied()
-            .filter(|id| {
-                !self.workspaces.is_floating(*id) && !self.workspaces.is_fullscreen(*id)
-            })
+            .filter(|id| !self.workspaces.is_floating(*id) && !self.workspaces.is_fullscreen(*id))
             .collect();
         let order: Vec<usize> = layout_tree
             .leaf_ids()
@@ -1142,9 +1138,7 @@ impl Wm {
     /// drop-down rect as the window's own geometry, and `reveal_all` would hand
     /// that back on exit.
     fn remember_scratch_shape(&mut self, id: usize, rect: Rect) {
-        if !self.scratch_saves.contains_key(&id) {
-            self.scratch_saves.insert(id, rect);
-        }
+        self.scratch_saves.entry(id).or_insert(rect);
     }
 
     /// Pull the scratchpad window back up: restore its own shape and re-tile it.
@@ -1171,7 +1165,9 @@ impl Wm {
     fn scratchpad_focus(&self, mon: isize) -> Option<usize> {
         self.windows
             .values()
-            .filter(|w| w.monitor == mon && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE)
+            .filter(|w| {
+                w.monitor == mon && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE
+            })
             .max_by_key(|w| win32::is_maximized(w.hwnd))
             .map(|w| w.id)
     }
@@ -1265,19 +1261,13 @@ impl Wm {
             .cloned()
             .unwrap_or_default()
             .deactivate(active);
-        let target = tree
-            .leaf_ids()
-            .into_iter()
-            .next()
-            .or_else(|| {
-                self.windows
-                    .values()
-                    .filter(|w| {
-                        w.monitor == mon && self.workspaces.workspace_of(w.id) == active
-                    })
-                    .map(|w| w.id)
-                    .next()
-            });
+        let target = tree.leaf_ids().into_iter().next().or_else(|| {
+            self.windows
+                .values()
+                .filter(|w| w.monitor == mon && self.workspaces.workspace_of(w.id) == active)
+                .map(|w| w.id)
+                .next()
+        });
         if let Some(id) = target {
             if let Some(hwnd) = self.hwnd_of(id) {
                 win32::set_foreground(hwnd);
@@ -1322,7 +1312,6 @@ impl Wm {
         }
         self.retile_all();
     }
-
 }
 
 /// Choose the monitor a windowless command should act on.
@@ -1344,7 +1333,9 @@ fn rule_matches(rule: &Rule, exe: &str, class: &str, title: &str) -> bool {
     let check = |pat: &Option<String>, value: &str| -> bool {
         match pat {
             None => true,
-            Some(p) => !p.is_empty() && value.to_ascii_lowercase().contains(&p.to_ascii_lowercase()),
+            Some(p) => {
+                !p.is_empty() && value.to_ascii_lowercase().contains(&p.to_ascii_lowercase())
+            }
         }
     };
     check(&rule.exe, exe) && check(&rule.class, class) && check(&rule.title, title)
@@ -1413,11 +1404,7 @@ fn seed_layouts(cfg: &Config, monitors: &[Monitor]) -> HashMap<isize, LayoutKind
     let mut out = HashMap::new();
     for (i, m) in monitors.iter().enumerate() {
         let key = (i + 1).to_string();
-        let kind = cfg
-            .layouts
-            .get(&key)
-            .copied()
-            .unwrap_or(cfg.default_layout);
+        let kind = cfg.layouts.get(&key).copied().unwrap_or(cfg.default_layout);
         out.insert(m.handle, kind);
     }
     out
@@ -1460,8 +1447,18 @@ mod tests {
             action: "float".to_string(),
             ..Default::default()
         };
-        assert!(rule_matches(&r, "C:\\Windows\\Notepad.exe", "Notepad", "Untitled"));
-        assert!(!rule_matches(&r, "explorer.exe", "CabinetWClass", "Desktop"));
+        assert!(rule_matches(
+            &r,
+            "C:\\Windows\\Notepad.exe",
+            "Notepad",
+            "Untitled"
+        ));
+        assert!(!rule_matches(
+            &r,
+            "explorer.exe",
+            "CabinetWClass",
+            "Desktop"
+        ));
     }
 
     #[test]
@@ -1478,8 +1475,18 @@ mod tests {
             action: "float".to_string(),
             ..Default::default()
         };
-        assert!(rule_matches(&r, "chrome.exe", "Chrome_WidgetWin_1", "DevTools - Console"));
-        assert!(!rule_matches(&r, "chrome.exe", "Chrome_WidgetWin_1", "Gmail"));
+        assert!(rule_matches(
+            &r,
+            "chrome.exe",
+            "Chrome_WidgetWin_1",
+            "DevTools - Console"
+        ));
+        assert!(!rule_matches(
+            &r,
+            "chrome.exe",
+            "Chrome_WidgetWin_1",
+            "Gmail"
+        ));
     }
 
     #[test]

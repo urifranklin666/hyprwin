@@ -56,7 +56,8 @@ impl WorkspaceState {
     }
 
     pub fn assign(&mut self, id: usize, ws: u32) {
-        self.assignment.insert(id, ws.clamp(1, self.workspace_count));
+        self.assignment
+            .insert(id, ws.clamp(1, self.workspace_count));
     }
 
     /// Assign without clamping, so the reserved scratchpad workspace is reachable.
@@ -70,7 +71,10 @@ impl WorkspaceState {
 
     /// Is the scratchpad dropped down on this monitor?
     pub fn scratchpad_visible(&self, monitor: isize) -> bool {
-        self.scratchpad_visible.get(&monitor).copied().unwrap_or(false)
+        self.scratchpad_visible
+            .get(&monitor)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Drop the scratchpad down or pull it back up. Returns the new state.
@@ -105,7 +109,12 @@ impl WorkspaceState {
             .copied()
             .filter(|f| *f)
             .map(|_| FLOATING_DEFAULT_WORKSPACE)
-            .unwrap_or_else(|| *self.assignment.get(&id).unwrap_or(&FLOATING_DEFAULT_WORKSPACE))
+            .unwrap_or_else(|| {
+                *self
+                    .assignment
+                    .get(&id)
+                    .unwrap_or(&FLOATING_DEFAULT_WORKSPACE)
+            })
     }
 
     pub fn is_floating(&self, id: usize) -> bool {
@@ -147,7 +156,9 @@ impl WorkspaceState {
     /// Windows assigned to a workspace, in insertion-independent order.
     #[allow(dead_code)]
     pub fn on_workspace<'a>(&self, ids: impl Iterator<Item = &'a usize>, ws: u32) -> Vec<usize> {
-        ids.copied().filter(|id| self.workspace_of(*id) == ws).collect()
+        ids.copied()
+            .filter(|id| self.workspace_of(*id) == ws)
+            .collect()
     }
 }
 
@@ -186,7 +197,11 @@ mod tests {
         assert_eq!(s.workspace_after(0, -1), 3, "going back from 1 wraps to 3");
         assert_eq!(s.workspace_after(0, 1), 2);
         s.set_active(0, 3);
-        assert_eq!(s.workspace_after(0, 1), 1, "forward from the last wraps to 1");
+        assert_eq!(
+            s.workspace_after(0, 1),
+            1,
+            "forward from the last wraps to 1"
+        );
     }
 
     #[test]
@@ -194,7 +209,11 @@ mod tests {
         let mut s = WorkspaceState::new(9);
         s.set_active(0, 4);
         assert_eq!(s.workspace_after(0, 1), 5);
-        assert_eq!(s.active(0), 4, "querying must not change the active workspace");
+        assert_eq!(
+            s.active(0),
+            4,
+            "querying must not change the active workspace"
+        );
     }
 
     #[test]
@@ -251,7 +270,11 @@ mod tests {
         s.assign_raw(4, SCRATCHPAD_WORKSPACE);
         assert_eq!(s.workspace_of(4), SCRATCHPAD_WORKSPACE);
         s.assign(4, SCRATCHPAD_WORKSPACE);
-        assert_eq!(s.workspace_of(4), 9, "the clamping assign folds it back down");
+        assert_eq!(
+            s.workspace_of(4),
+            9,
+            "the clamping assign folds it back down"
+        );
     }
 
     #[test]

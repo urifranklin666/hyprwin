@@ -109,7 +109,9 @@ pub const ACTIONS: [&str; 15] = [
 
 /// The help text `hyprwinctl` prints when asked, and the reply to a bad action.
 pub fn help() -> String {
-    let mut s = String::from("hyprwinctl - drive a running HyprWin\n\nusage: hyprwinctl <command> [arg]\n\n");
+    let mut s = String::from(
+        "hyprwinctl - drive a running HyprWin\n\nusage: hyprwinctl <command> [arg]\n\n",
+    );
     s.push_str("  status                     print status.json\n");
     s.push_str("  monitors                   print the per-monitor summary\n");
     s.push_str("  clients                    print the managed-window list\n");

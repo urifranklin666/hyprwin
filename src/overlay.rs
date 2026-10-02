@@ -18,13 +18,14 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, ShowWindow, UpdateLayeredWindow,
-    HTTRANSPARENT, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_NCHITTEST, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, ShowWindow,
+    UpdateLayeredWindow, HTTRANSPARENT, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_NCHITTEST,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER};
@@ -181,9 +182,7 @@ impl Overlay {
             ..Default::default()
         };
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let bitmap = unsafe {
-            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
-        };
+        let bitmap = unsafe { CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) };
         unsafe { ReleaseDC(None, screen) };
         let bitmap = match bitmap {
             Ok(b) => b,
@@ -229,21 +228,14 @@ impl Overlay {
         let outer = f.local;
         // A frame can never be thicker than the tile allows, or the inner shape
         // would vanish and the whole rectangle would fill in.
-        let t = f
-            .width
-            .clamp(0, (outer.w.min(outer.h)).max(0) / 2);
+        let t = f.width.clamp(0, (outer.w.min(outer.h)).max(0) / 2);
         if t <= 0 || outer.w <= 0 || outer.h <= 0 {
             return false;
         }
         // The inner edge keeps the same corner radius, so the band is an even
         // thickness all the way around the arc. Its radius shrinks by the
         // thickness, bottoming out at a square corner rather than inverting.
-        let inner = Rect::new(
-            outer.x + t,
-            outer.y + t,
-            outer.w - 2 * t,
-            outer.h - 2 * t,
-        );
+        let inner = Rect::new(outer.x + t, outer.y + t, outer.w - 2 * t, outer.h - 2 * t);
         let outer_rad = f.radius.clamp(0, (outer.w.min(outer.h) - 1).max(0) / 2);
         let inner_rad = (outer_rad - t).max(0);
         let (a, b) = (f.color_a, f.color_b);
@@ -445,7 +437,10 @@ mod tests {
         assert!(in_rounded((5, 5), r, 0), "top-left corner is inside");
         assert!(in_rounded((14, 14), r, 0), "bottom-right pixel is inside");
         assert!(!in_rounded((4, 5), r, 0), "one pixel left is outside");
-        assert!(!in_rounded((15, 5), r, 0), "one past the right edge is outside");
+        assert!(
+            !in_rounded((15, 5), r, 0),
+            "one past the right edge is outside"
+        );
     }
 
     #[test]

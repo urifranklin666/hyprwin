@@ -46,23 +46,13 @@ pub struct MonitorStatus {
     pub work_area: RectStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FocusedStatus {
     /// Empty when the focused window is not one HyprWin manages.
     pub title: String,
     pub exe: String,
     /// 1-based monitor index, or 0 when unknown.
     pub monitor: usize,
-}
-
-impl Default for FocusedStatus {
-    fn default() -> Self {
-        FocusedStatus {
-            title: String::new(),
-            exe: String::new(),
-            monitor: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

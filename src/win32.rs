@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, IsZoomed, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, GWL_EXSTYLE, GW_OWNER, SPI_GETFOREGROUNDLOCKTIMEOUT, SPIF_SENDCHANGE,
+    SystemParametersInfoW, GWL_EXSTYLE, GW_OWNER, SPIF_SENDCHANGE, SPI_GETFOREGROUNDLOCKTIMEOUT,
     SPI_SETFOREGROUNDLOCKTIMEOUT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
     SW_SHOWNA, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
@@ -174,9 +174,7 @@ pub fn is_manageable(hwnd: HWND) -> bool {
         return false;
     }
     // Never manage our own windows (the tray host, for one).
-    if pid(hwnd) == unsafe {
-        windows::Win32::System::Threading::GetCurrentProcessId()
-    } {
+    if pid(hwnd) == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() } {
         return false;
     }
     let cls = class_name(hwnd);
@@ -193,7 +191,12 @@ pub fn is_manageable(hwnd: HWND) -> bool {
         return false;
     }
     // Shell surfaces that must never be tiled.
-    for skip in ["Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW"] {
+    for skip in [
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "Progman",
+        "WorkerW",
+    ] {
         if cls == skip {
             return false;
         }
@@ -227,12 +230,7 @@ pub fn rect_of(hwnd: HWND) -> Option<Rect> {
             return None;
         }
     }
-    Some(Rect::new(
-        r.left,
-        r.top,
-        r.right - r.left,
-        r.bottom - r.top,
-    ))
+    Some(Rect::new(r.left, r.top, r.right - r.left, r.bottom - r.top))
 }
 
 /// Restore a window that Windows has snapped/maximised so we can tile it.
@@ -409,7 +407,10 @@ mod tests {
     #[test]
     fn enumeration_finds_the_desktop() {
         let all = top_level_windows();
-        assert!(!all.is_empty(), "there is always at least one top-level window");
+        assert!(
+            !all.is_empty(),
+            "there is always at least one top-level window"
+        );
         assert!(
             all.iter().any(|h| class_name(*h) == "Progman"),
             "the desktop window should be enumerable"

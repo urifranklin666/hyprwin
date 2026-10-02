@@ -91,7 +91,14 @@ pub fn is_enabled() -> bool {
         }
         let mut kind = REG_SZ;
         let mut size = 0u32;
-        let res = RegQueryValueExW(hkey, VALUE_NAME, None, Some(&mut kind), None, Some(&mut size));
+        let res = RegQueryValueExW(
+            hkey,
+            VALUE_NAME,
+            None,
+            Some(&mut kind),
+            None,
+            Some(&mut size),
+        );
         let _ = RegCloseKey(hkey);
         res.is_ok() && size > 0
     }
