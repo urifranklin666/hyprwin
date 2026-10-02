@@ -789,6 +789,11 @@ impl Wm {
             // be undone by the restore that followed it. Un-maximizing first also
             // means the placement afterwards is the last word, which is what the
             // caller wants.
+            //
+            // This is unconditional, floating windows included. `SW_RESTORE` is
+            // the only thing that clears the zoomed flag, so skipping it for a
+            // window the user maximized leaves it at its old rectangle *still
+            // zoomed* — the half-restored state this whole fix exists to avoid.
             win32::unmaximize(w.hwnd);
             // A scratchpad window was floated and blown up; hand back the size
             // it had, which `saved_rects` does not know about.
