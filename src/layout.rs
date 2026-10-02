@@ -4,8 +4,9 @@
 //! rectangles. That keeps the interesting logic unit-testable without a display.
 
 use crate::config::{Direction, LayoutKind};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -83,7 +84,7 @@ impl Rect {
 ///
 /// Split ratios live in the tree, so resizing one split does not disturb the
 /// rest of the layout and windows do not jump when another window closes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     Leaf {
         id: usize,
@@ -96,7 +97,7 @@ pub enum Node {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DwindleTree {
     pub root: Option<Node>,
 }
@@ -432,6 +433,18 @@ impl Forest {
     #[allow(dead_code)]
     pub fn workspaces_tracked(&self) -> usize {
         self.trees.iter().filter(|t| t.is_some()).count()
+    }
+
+    /// Every parked tree with the workspace number it belongs to.
+    ///
+    /// Workspace numbers are 1-based, so slot `i` is workspace `i + 1`; that is
+    /// the key a session document stores, since it is stable across a restart
+    /// while the monitor handle it is filed under is not.
+    pub fn slots(&self) -> impl Iterator<Item = (u32, &Node)> {
+        self.trees
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.as_ref().map(|root| (i as u32 + 1, root)))
     }
 }
 

@@ -15,6 +15,7 @@ mod log;
 mod monitor;
 mod overlay;
 mod protocol;
+mod session;
 mod status;
 mod tray;
 mod win32;
@@ -114,6 +115,7 @@ impl Drop for DesktopGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             crate::log_warn!("[hyprwin] exiting without a clean shutdown; restoring the desktop");
+            self.wm.save_session_on_exit();
             self.wm.reveal_all();
             self.wm.publish_stopped();
         }
@@ -179,6 +181,22 @@ fn run() -> Result<()> {
 
     let mut wm = Wm::new(cfg);
 
+    // Read the remembered arrangement before adopting anything, so each window is
+    // matched to its record as it is taken over. A missing, damaged or
+    // wrong-version file simply means a fresh start.
+    if wm.cfg.persist_session {
+        if let Some(session) = session::Session::load(&wm.cfg.session_path()) {
+            crate::log_info!(
+                "[hyprwin] restoring session: {} window(s), {} monitor(s)",
+                session.windows.len(),
+                session.monitors.len()
+            );
+            wm.load_session(session);
+        } else {
+            crate::log_info!("[hyprwin] no session to restore");
+        }
+    }
+
     // Control pipe: lets `hyprwinctl` and scripts drive a running instance. It
     // only ever queues events, so tiling state stays on this thread. Started
     // before adoption so the first retile populates its snapshot.
@@ -195,6 +213,11 @@ fn run() -> Result<()> {
         "[hyprwin] managing {adopted} existing windows across {} monitor(s)",
         wm.monitors.len()
     );
+
+    // Adoption is over, so the remembered workspaces, layouts and split trees can
+    // be applied now that every window has an id. This also opens the session
+    // file for writing, so the arrangement starts being remembered from here.
+    wm.apply_session();
 
     let tray = tray::Tray::create();
     if tray.is_none() {
@@ -220,8 +243,10 @@ fn run() -> Result<()> {
     let exit_code = message_loop(guard.wm(), &rx, &mut hotkeys);
 
     // Hand the desktop back: unhide anything parked on an off-screen workspace
-    // and restore the geometry every window had before we tiled it. Disarming
-    // after makes the guard's own Drop a no-op on the normal path.
+    // and restore the geometry every window had before we tiled it. The session
+    // is written first, while the windows are still where they were tiled, since
+    // `reveal_all` is about to put them back and the arrangement would be lost.
+    guard.wm().save_session_on_exit();
     guard.wm().reveal_all();
     guard.wm().publish_stopped();
     guard.disarm();

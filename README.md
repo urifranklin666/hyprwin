@@ -13,7 +13,7 @@ komorebi and GlazeWM, and it is the only model Windows permits.
 
 ## Status
 
-Working, verified by the unit suite (`125 passed`), a clean release build and a
+Working, verified by the unit suite (`134 passed`), a clean release build and a
 live run against a two-monitor desktop. See
 [Manual smoke test](#manual-smoke-test) for the checklist to run yourself.
 
@@ -27,6 +27,7 @@ live run against a two-monitor desktop. See
 | Persistent split ratios | Resizing one split survives retiling; the master ratio is remembered **per workspace**, so a width set on workspace 3 does not bleed into workspace 4 |
 | Drag to rearrange | Dragging a tiled window's title bar across the desktop moves it to that monitor; dropping it on a neighbour swaps the two; dragging a border resizes the split. Floating windows are left alone |
 | Per-workspace layout memory | Leaving a workspace parks its dwindle tree, so windows return to the position they had |
+| Session persistence | Workspaces, layouts, split ratios, floating rectangles and each window's slot come back after a restart, matching windows to their old positions — see below |
 | Clean exit | Quitting un-hides windows parked on other workspaces and restores their original geometry, including whether each was maximized when HyprWin adopted it |
 | Gaps | Configurable outer (edge) and inner (between windows) |
 | Borders + rounding | DWM accent border, active/inactive colours, Win11 corner rounding |
@@ -177,6 +178,8 @@ the documented default.
   "autostart": false,
   "status_file": true,
   "status_path": "",
+  "persist_session": true,
+  "session_path": "",
   "log_path": "",
   "log_level": "info",
   "keybinds": [],
@@ -208,6 +211,8 @@ the documented default.
 | `autostart` | Register the binary in `HKCU\...\Run` |
 | `status_file` | Write the status document described below |
 | `status_path` | Where to write it; empty means `status.json` beside `config.json` |
+| `persist_session` | Remember the arrangement across restarts — see below |
+| `session_path` | Where to write it; empty means `session.json` beside `config.json` |
 | `log_path` | Where to write the log; empty means `hyprwin.log` beside `config.json` |
 | `log_level` | `error`, `warn`, `info`, `debug` or `off` |
 
@@ -280,6 +285,34 @@ All specified fields must match; matching is case-insensitive substring.
 - `workspace` — send it to `arg` (a workspace number) on creation
 - `monitor` — send it to `arg` (`next`, `prev`, `1`, `2`, … or `primary`)
 - `scratchpad` — adopt it onto the scratchpad and drop it down
+
+---
+
+## Session persistence
+
+With `persist_session` true (the default), HyprWin remembers the arrangement and
+picks it back up on the next start, so restarting the manager no longer resets
+what you had open. It remembers:
+
+- each window's workspace, floating/fullscreen state, and — for a floating
+  window, which has no layout slot to recompute from — its rectangle;
+- each monitor's active workspace and layout kind;
+- the dwindle split tree per workspace, so windows come back to the slot and
+  proportions they had;
+- the master-layout ratio per workspace.
+
+The document is written to `session.json` (or `session_path`) on every change,
+replaced atomically, and once more just before shutdown — so a crash still leaves
+a recent arrangement behind. Set `persist_session` to `false` to neither read nor
+write it; deleting the file is a one-step way to start fresh.
+
+Windows are matched by **executable, class and title**, because an id is assigned
+per run and an HWND does not survive a restart; a title that has changed falls
+back to class and then executable, and each remembered window is claimed once so
+two windows of the same program are restored one-to-one. Monitors are keyed by
+their 1-based, primary-first index, the same number `layouts` and `status.json`
+use. A window that did not come back simply drops out of the arrangement, and
+windows that appear after startup are tiled normally rather than restored.
 
 ---
 

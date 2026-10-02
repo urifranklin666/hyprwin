@@ -7,6 +7,7 @@ use crate::config::{size_limit, Config, Direction, LayoutKind, Rule};
 use crate::layout::{self, DwindleTree, Forest, Rect};
 use crate::monitor::{self, Monitor};
 use crate::overlay::Overlays;
+use crate::session::{self, MasterRatio, Session, WindowSession, WorkspaceTree};
 use crate::status::{FocusedStatus, MonitorStatus, Status};
 use crate::win32;
 use crate::workspace::{WorkspaceState, SCRATCHPAD_WORKSPACE};
@@ -90,6 +91,25 @@ pub struct Wm {
     /// display, trade places with a neighbour, or resize the split, without ever
     /// taking the mouse.
     drag: Option<DragState>,
+
+    /// The session read at startup, still being handed out to windows as they
+    /// are adopted. `None` when there was nothing to restore.
+    ///
+    /// Kept until adoption is done rather than applied up front because a window
+    /// has no id until it is adopted, and a parked tree is keyed by the id a
+    /// window had in the run that saved it.
+    restore: Option<Session>,
+    /// Has the saved session been read and applied for this run?
+    ///
+    /// Saving is suppressed until it has, or the first retile of a fresh run
+    /// would overwrite the session with its own empty state before it was read.
+    session_loaded: bool,
+    /// Has the arrangement changed since it was last written?
+    session_dirty: bool,
+    /// Saved id (from the run that wrote the session) -> this run's id, for every
+    /// window matched so far. `finalize_restore` uses it to re-key the parked
+    /// dwindle trees, which reference windows by that older id.
+    restored_ids: HashMap<usize, usize>,
 }
 
 /// The start of a move/resize gesture, remembered until it ends.
@@ -152,6 +172,10 @@ impl Wm {
             tween: None,
             border_fade: None,
             drag: None,
+            restore: None,
+            session_loaded: false,
+            session_dirty: false,
+            restored_ids: HashMap::new(),
         }
     }
 
@@ -343,18 +367,27 @@ impl Wm {
             .any(|r| rule_matches(r, &exe, &class, &title))
     }
 
-    /// Which monitor a window should live on: a `monitor` rule if one matches,
-    /// otherwise the one it physically overlaps.
-    fn target_monitor(&self, hwnd: HWND, exe: &str, class: &str, title: &str) -> Option<isize> {
-        let named = self
-            .cfg
+    /// The monitor *index* (1-based, primary first) a `monitor` rule names.
+    ///
+    /// Kept separate from `target_monitor` so the session restore can ask
+    /// whether a rule expressed a monitor preference at all: a rule is a
+    /// deliberate instruction and outranks what was merely remembered.
+    fn rule_monitor(&self, exe: &str, class: &str, title: &str) -> Option<usize> {
+        self.cfg
             .rules
             .iter()
             .filter(|r| r.action == "monitor")
             .find(|r| rule_matches(r, exe, class, title))
             .and_then(|r| r.arg.as_deref())
-            .and_then(|a| parse_monitor(a, &self.monitors));
-        named.or_else(|| Some(self.monitor_for(hwnd)))
+            .and_then(|a| parse_monitor_index(a, self.monitors.len()))
+    }
+
+    /// Which monitor a window should live on: a `monitor` rule if one matches,
+    /// otherwise the one it physically overlaps.
+    fn target_monitor(&self, hwnd: HWND, exe: &str, class: &str, title: &str) -> Option<isize> {
+        self.rule_monitor(exe, class, title)
+            .and_then(|i| self.monitors.get(i - 1).map(|m| m.handle))
+            .or_else(|| Some(self.monitor_for(hwnd)))
     }
 
     fn rule_fields(&self, hwnd: HWND) -> (String, String, String) {
@@ -392,13 +425,38 @@ impl Wm {
         let (exe, class, title) = self.rule_fields(hwnd);
         let mon = self.target_monitor(hwnd, &exe, &class, &title).unwrap_or(0);
         let scratch = self.rule_scratchpads(hwnd);
+        let restore = if self.session_loaded || scratch {
+            None
+        } else {
+            self.take_saved_window(&exe, &class, &title)
+        };
         let ws = if scratch {
             SCRATCHPAD_WORKSPACE
+        } else if let Some(r) = &restore {
+            r.workspace.max(1)
         } else {
             self.rule_target_workspace(hwnd)
                 .unwrap_or_else(|| self.workspaces.active(mon))
         };
-        let float = self.rule_floats(hwnd);
+        let float = restore
+            .as_ref()
+            .map(|r| r.floating)
+            .unwrap_or_else(|| self.rule_floats(hwnd));
+        // A saved `monitor` is a 1-based, primary-first index, the one identity
+        // `layouts["N"]` and `status.json` use. A rule still describes what the
+        // user *wants* for this program, so it wins over the remembered monitor.
+        let rule_mon = self
+            .rule_monitor(&exe, &class, &title)
+            .and_then(|i| self.monitors.get(i - 1).map(|m| m.handle));
+        let mon = rule_mon
+            .or_else(|| {
+                restore.as_ref().and_then(|r| {
+                    self.monitors
+                        .get(r.monitor.saturating_sub(1))
+                        .map(|m| m.handle)
+                })
+            })
+            .unwrap_or(mon);
 
         let id = self.next_id;
         self.next_id += 1;
@@ -414,6 +472,20 @@ impl Wm {
         }
         self.workspaces.assign_raw(id, ws);
         self.workspaces.set_floating(id, float);
+        if restore.as_ref().is_some_and(|r| r.fullscreen) {
+            self.workspaces.set_fullscreen(id, true);
+        }
+        // A floating window has no layout slot to recompute a rectangle from, so
+        // the one it was left at is the only record of it. A tiled window's
+        // geometry is the layout's business and is rebuilt by the retile below.
+        if float {
+            if let Some(r) = restore.as_ref().and_then(|r| r.rect) {
+                win32::set_pos(hwnd, r);
+            }
+        }
+        if let Some(r) = &restore {
+            self.restored_ids.insert(r.id, id);
+        }
         self.windows.insert(
             id,
             ManagedWindow {
@@ -449,6 +521,12 @@ impl Wm {
                 win32::set_rounding(hwnd, self.cfg.rounding);
             }
         }
+        // A fullscreen window fills its monitor. Restoring the flag alone would
+        // leave it at its tile size until the user toggled it, since a fullscreen
+        // window is excluded from the layout that would otherwise place it.
+        if restore.as_ref().is_some_and(|r| r.fullscreen) {
+            win32::set_pos(hwnd, self.monitor_rect(mon));
+        }
         self.retile_monitor(mon);
         self.apply_border_focus();
         Some(id)
@@ -476,6 +554,143 @@ impl Wm {
         self.manage(hwnd).is_some()
     }
 
+    /// Take the record identifying this window from the session being restored.
+    fn take_saved_window(&mut self, exe: &str, class: &str, title: &str) -> Option<WindowSession> {
+        self.restore.as_mut()?.take_window(exe, class, title)
+    }
+
+    /// Hand the manager the session read from disk, to be applied to windows as
+    /// they are adopted and finalised by `apply_session`.
+    pub fn load_session(&mut self, session: Session) {
+        self.restore = Some(session);
+    }
+
+    /// Apply the remembered arrangement: monitor workspaces and layouts, then the
+    /// parked split trees, then one retile to bring it all on screen.
+    ///
+    /// Called once adoption has finished, because a window has no id until it is
+    /// adopted and the parked trees are keyed by the id windows had in the run
+    /// that saved the session. Whether or not there was a session, this marks the
+    /// run as loaded, which is what lets the arrangement start being remembered.
+    pub fn apply_session(&mut self) {
+        let Some(session) = self.restore.take() else {
+            self.session_loaded = true;
+            return;
+        };
+
+        // Rebuild the parked trees first: they reference windows by their old
+        // id, and `restored_ids` says which id each has now. A slot with a window
+        // that did not come back cannot be restored and is skipped, which leaves
+        // its windows to be spliced into the layout normally.
+        self.install_restored_trees(&session);
+
+        // Restore the master splits the user had widened or narrowed, so a
+        // workspace in the master layout comes back with the same proportions.
+        for mr in &session.master_ratios {
+            if mr.workspace >= 1 && mr.workspace <= self.cfg.workspaces {
+                self.cfg
+                    .master_ratios
+                    .insert(mr.workspace.to_string(), mr.ratio.clamp(0.1, 0.9));
+            }
+        }
+
+        // Then each monitor's workspace and layout. The layout is independent of
+        // which windows came back, so it is restored either way; the workspace is
+        // only moved when it is one the current config still has.
+        for ms in &session.monitors {
+            let Some(mon) = self
+                .monitors
+                .get(ms.index.saturating_sub(1))
+                .map(|m| m.handle)
+            else {
+                continue;
+            };
+            if let Some(kind) = LayoutKind::parse(&ms.layout) {
+                self.layouts.insert(mon, kind);
+            }
+            if ms.active_workspace >= 1 && ms.active_workspace <= self.cfg.workspaces {
+                self.switch_workspace_silent(mon, ms.active_workspace);
+            }
+        }
+
+        self.tiling_enabled = true;
+        for m in self.monitors.clone() {
+            self.retile_monitor(m.handle);
+        }
+        // Adoption is over, so the live arrangement is the one to remember now;
+        // writing once prunes whatever did not come back from the file.
+        self.session_loaded = true;
+        self.session_dirty = true;
+        self.save_session();
+    }
+
+    /// Copy each saved dwindle tree into its monitor's forest, re-keyed.
+    ///
+    /// Split out from `apply_session` so the re-keying can be tested without a
+    /// live window: the retile that follows the restore reconciles every tree
+    /// against the windows actually managed, which would hide whether the install
+    /// itself was right.
+    fn install_restored_trees(&mut self, session: &Session) {
+        for wt in &session.trees {
+            let Some(root) = &wt.tree.root else { continue };
+            // The scratchpad's tree is never saved (it sits above the workspace
+            // range), so anything out of range is simply not restorable.
+            if wt.workspace == 0 || wt.workspace > self.cfg.workspaces {
+                continue;
+            }
+            let Some(new_root) = session::rewrite_tree(root, &self.restored_ids) else {
+                continue;
+            };
+            let Some(mon) = self
+                .monitors
+                .get(wt.monitor.saturating_sub(1))
+                .map(|m| m.handle)
+            else {
+                continue;
+            };
+            let mut forest = self.forests.get(&mon).cloned().unwrap_or_default();
+            forest.activate(
+                &DwindleTree {
+                    root: Some(new_root),
+                },
+                wt.workspace,
+            );
+            self.forests.insert(mon, forest);
+        }
+    }
+
+    /// Move a monitor to `target` without stealing focus or raising a window.
+    ///
+    /// `switch_workspace` is the interactive path: it raises the first window of
+    /// the new workspace so the keyboard addresses something visible. During a
+    /// restore there is no user to hand focus to yet, and stealing the foreground
+    /// at startup would be rude, so the windows are hidden and shown directly.
+    fn switch_workspace_silent(&mut self, mon: isize, target: u32) {
+        let before = self.workspaces.active(mon);
+        if before == target {
+            return;
+        }
+        if self.workspaces.scratchpad_visible(mon) {
+            self.workspaces.toggle_scratchpad(mon);
+        }
+        let leaving: Vec<usize> = self
+            .windows
+            .values()
+            .filter(|w| {
+                w.monitor == mon
+                    && !self.workspaces.is_floating(w.id)
+                    && self.workspaces.workspace_of(w.id) == before
+            })
+            .map(|w| w.id)
+            .collect();
+        for id in leaving {
+            if let Some(hwnd) = self.hwnd_of(id) {
+                win32::hide(hwnd);
+            }
+        }
+        self.workspaces.set_active(mon, target);
+    }
+
     pub fn unmanage(&mut self, hwnd: HWND) {
         let Some(id) = self.id_of(hwnd) else {
             return;
@@ -487,6 +702,7 @@ impl Wm {
         self.placed.remove(&id);
         self.saved_rects.remove(&id);
         self.scratch_saves.remove(&id);
+        self.restored_ids.retain(|_, new| *new != id);
         // Drop it from the parked tree of every workspace, not just the active
         // one, or a stale leaf would come back when you next visit that desktop.
         self.forests.entry(mon).or_default().forget(id);
@@ -502,6 +718,7 @@ impl Wm {
         self.placed.remove(&id);
         self.saved_rects.remove(&id);
         self.scratch_saves.remove(&id);
+        self.restored_ids.retain(|_, new| *new != id);
     }
 
     /// Remember the geometry a move/resize gesture started from.
@@ -949,11 +1166,128 @@ impl Wm {
         self.apply_visibility(mon);
         self.persist_tree(mon, active, &tree);
         // Every change to the layout funnels through a retile, so this is the one
-        // place the status document needs to be republished.
+        // place the status document needs to be republished — and the one place
+        // the arrangement needs to be remembered.
         self.publish_status();
+        self.session_dirty = true;
+        self.save_session();
         // The focused tile's accent may have moved with the layout; the retile
         // repaints it at its new rect rather than easing a stale one.
         self.apply_border_focus();
+    }
+
+    /// Write the arrangement to the session file, if one is being kept.
+    ///
+    /// Called from the retile, which every layout change funnels through, and
+    /// once more at shutdown. Like the status document, a failed write is logged
+    /// and otherwise ignored: remembering the arrangement is a convenience, not a
+    /// reason to stop tiling.
+    pub fn save_session(&self) {
+        if !self.cfg.persist_session || !self.session_loaded || !self.session_dirty {
+            return;
+        }
+        if let Err(e) = self.session_document().write(&self.cfg.session_path()) {
+            crate::log_warn!("[hyprwin] could not write session file: {e}");
+        }
+    }
+
+    /// Write a final session on the way out, before the desktop is handed back.
+    ///
+    /// `reveal_all` restores every window's *pre-HyprWin* geometry, which is not
+    /// the arrangement; taking the snapshot first is what remembers where the
+    /// windows were actually tiled.
+    pub fn save_session_on_exit(&mut self) {
+        self.session_dirty = true;
+        self.save_session();
+    }
+
+    /// The arrangement as a session document.
+    ///
+    /// Built from the live ids and monitor handles; `wm` is the only module that
+    /// knows how to translate them into the stable identities a restart can match
+    /// (`session` owns the document and its write).
+    fn session_document(&self) -> Session {
+        let index_of = |mon: isize| {
+            self.monitors
+                .iter()
+                .position(|m| m.handle == mon)
+                .map(|i| i + 1)
+        };
+
+        let monitors = self
+            .monitors
+            .iter()
+            .enumerate()
+            .map(|(i, m)| session::MonitorSession {
+                index: i + 1,
+                active_workspace: self.workspaces.active(m.handle),
+                layout: self.layout_of(m.handle).name().to_string(),
+            })
+            .collect();
+
+        let mut windows = Vec::with_capacity(self.windows.len());
+        for w in self.windows.values() {
+            let Some(mon) = index_of(w.monitor) else {
+                continue;
+            };
+            let floating = self.workspaces.is_floating(w.id);
+            // Only a floating window's rectangle is remembered: a tiled window's
+            // geometry is the layout's, and is rebuilt from the tree on restore.
+            // A floating window has no layout slot to rebuild from, and `placed`
+            // never holds one (it is filled by the tiling pass, which skips
+            // floating windows), so read where the window actually is.
+            let rect = floating.then(|| win32::rect_of(w.hwnd)).flatten();
+            windows.push(WindowSession {
+                id: w.id,
+                exe: win32::exe_name(w.hwnd),
+                class: win32::class_name(w.hwnd),
+                title: win32::title(w.hwnd),
+                monitor: mon,
+                workspace: self.workspaces.workspace_of(w.id),
+                floating,
+                fullscreen: self.workspaces.is_fullscreen(w.id),
+                rect,
+            });
+        }
+
+        let mut trees = Vec::new();
+        for (i, m) in self.monitors.iter().enumerate() {
+            let Some(forest) = self.forests.get(&m.handle) else {
+                continue;
+            };
+            for (ws, root) in forest.slots() {
+                trees.push(WorkspaceTree {
+                    monitor: i + 1,
+                    workspace: ws,
+                    tree: DwindleTree {
+                        root: Some(root.clone()),
+                    },
+                });
+            }
+        }
+
+        // A master split is kept in the config, not in a tree, so a resize there
+        // is remembered here. Only the ones the user actually changed have an
+        // entry; the rest follow `master_ratio` and are not worth writing.
+        let master_ratios = self
+            .cfg
+            .master_ratios
+            .iter()
+            .filter_map(|(k, v)| {
+                k.parse::<u32>().ok().map(|workspace| MasterRatio {
+                    workspace,
+                    ratio: *v,
+                })
+            })
+            .collect();
+
+        Session {
+            version: session::SESSION_VERSION,
+            monitors,
+            windows,
+            trees,
+            master_ratios,
+        }
     }
 
     /// Write the status document if the user asked for one. Failures are logged
@@ -1360,14 +1694,17 @@ fn rule_size_allows(rule: &Rule, size: Option<(i32, i32)>) -> bool {
 
 /// A monitor named by index (`"1"`..`"N"`, primary-first) or `"primary"`.
 fn parse_monitor(arg: &str, monitors: &[Monitor]) -> Option<isize> {
+    parse_monitor_index(arg, monitors.len()).and_then(|i| monitors.get(i - 1).map(|m| m.handle))
+}
+
+/// The 1-based monitor index an argument names, or `"primary"`.
+///
+/// This is the identity `layouts["N"]` and `status.json` use, so it survives a
+/// restart where a monitor handle does not.
+fn parse_monitor_index(arg: &str, count: usize) -> Option<usize> {
     match arg.trim().to_ascii_lowercase().as_str() {
-        "primary" | "main" => monitors.iter().find(|m| m.primary).map(|m| m.handle),
-        n => n
-            .parse::<usize>()
-            .ok()
-            .and_then(|i| i.checked_sub(1))
-            .and_then(|i| monitors.get(i))
-            .map(|m| m.handle),
+        "primary" | "main" => Some(1),
+        n => n.parse::<usize>().ok().filter(|i| (1..=count).contains(i)),
     }
 }
 
@@ -1417,6 +1754,246 @@ use crate::config::Direction as WmDirection;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Node;
+
+    fn saved_window(id: usize, exe: &str, workspace: u32) -> WindowSession {
+        WindowSession {
+            id,
+            exe: exe.to_string(),
+            class: "Notepad".to_string(),
+            title: format!("{exe} {id}"),
+            monitor: 1,
+            workspace,
+            floating: false,
+            fullscreen: false,
+            rect: None,
+        }
+    }
+
+    /// A manager whose session file goes to a throwaway path.
+    ///
+    /// `Wm::new` reads the real display list and would otherwise write to the
+    /// user's own session file the moment `apply_session` runs; a test must never
+    /// touch it.
+    fn temp_session_wm(tag: &str) -> (Wm, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "hyprwin-session-wm-test-{tag}-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut wm = Wm::new(Config::default());
+        wm.cfg.session_path = path.to_string_lossy().into_owned();
+        // A retile republishes the status document, so keep that off the real
+        // path too; a test must not touch the user's files at all.
+        wm.cfg.status_file = false;
+        (wm, path)
+    }
+
+    #[test]
+    fn a_saved_window_is_handed_to_the_first_window_that_identifies_with_it() {
+        let mut wm = Wm::new(Config::default());
+        let mut session = Session::default();
+        session.windows.push(saved_window(4, "notepad.exe", 3));
+        session.windows.push(saved_window(5, "notepad.exe", 7));
+        wm.load_session(session);
+
+        // The exact title decides which record this window claims.
+        let first = wm
+            .take_saved_window("Notepad.EXE", "Notepad", "notepad.exe 5")
+            .expect("a case-insensitive exe with an exact title must match");
+        assert_eq!(first.workspace, 7, "the exact title selected the record");
+        // Consumed, so a second window cannot claim the same record.
+        let second = wm
+            .take_saved_window("notepad.exe", "Notepad", "notepad.exe 4")
+            .expect("the other record still stands");
+        assert_eq!(second.workspace, 3);
+        assert!(wm
+            .take_saved_window("notepad.exe", "Notepad", "x")
+            .is_none());
+    }
+
+    #[test]
+    fn nothing_is_restored_once_the_session_has_been_applied() {
+        let (mut wm, path) = temp_session_wm("applied");
+        let mut session = Session::default();
+        session.windows.push(saved_window(4, "notepad.exe", 3));
+        wm.load_session(session);
+
+        // Applying with no windows is the same as adoption having finished.
+        wm.apply_session();
+        assert!(wm.session_loaded);
+        assert!(
+            wm.take_saved_window("notepad.exe", "Notepad", "notepad.exe 4")
+                .is_none(),
+            "a window that appears after startup is tiled normally, not restored"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn there_is_a_session_to_save_only_after_adoption() {
+        let (mut wm, path) = temp_session_wm("gated");
+        wm.session_dirty = true;
+        wm.save_session();
+        assert!(
+            !wm.session_loaded,
+            "saving is gated until the saved session has been applied, so the \
+             first retile cannot overwrite it"
+        );
+        assert!(!path.exists(), "nothing was written before adoption");
+        wm.apply_session();
+        assert!(wm.session_loaded);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_restored_tree_is_rekeyed_onto_this_runs_ids_and_only_kept_if_it_is_whole() {
+        let mut wm = Wm::new(Config::default());
+        let mon = wm.monitors[0].handle;
+
+        // Both windows came back, with new ids of 10 and 11.
+        wm.restored_ids.insert(4, 10);
+        wm.restored_ids.insert(5, 11);
+        let mut session = Session::default();
+        session.monitors.push(session::MonitorSession {
+            index: 1,
+            active_workspace: 2,
+            layout: "master".to_string(),
+        });
+        session.trees.push(WorkspaceTree {
+            monitor: 1,
+            workspace: 2,
+            tree: DwindleTree {
+                root: Some(Node::Split {
+                    horizontal: true,
+                    ratio: 0.4,
+                    a: Box::new(Node::Leaf { id: 4 }),
+                    b: Box::new(Node::Leaf { id: 5 }),
+                }),
+            },
+        });
+        wm.install_restored_trees(&session);
+
+        let mut forest = wm
+            .forests
+            .get(&mon)
+            .cloned()
+            .expect("the monitor has a forest");
+        assert_eq!(
+            forest.deactivate(2).root,
+            Some(Node::Split {
+                horizontal: true,
+                ratio: 0.4,
+                a: Box::new(Node::Leaf { id: 10 }),
+                b: Box::new(Node::Leaf { id: 11 }),
+            }),
+            "the saved ids are rewritten to this run's ids, splits and ratios kept"
+        );
+
+        // With one of the two windows absent the slot cannot be rebuilt.
+        let mut wm = Wm::new(Config::default());
+        let mon = wm.monitors[0].handle;
+        wm.restored_ids.insert(4, 10);
+        wm.install_restored_trees(&session);
+        let mut forest = wm.forests.get(&mon).cloned().unwrap_or_default();
+        assert!(
+            forest.deactivate(2).root.is_none(),
+            "a tree missing one of its windows is dropped rather than left half-built"
+        );
+    }
+
+    #[test]
+    fn applying_a_session_restores_the_monitor_workspace_and_layout() {
+        // An empty session, applied with no windows, is the fresh-start case: it
+        // still marks the session as loaded so the arrangement starts being kept.
+        let (mut wm, path) = temp_session_wm("empty");
+        wm.apply_session();
+        assert!(wm.session_loaded);
+        let _ = std::fs::remove_file(&path);
+
+        // A session with monitor state and no windows still restores the layout
+        // and the active workspace, because neither depends on a window coming
+        // back.
+        let (mut wm, path) = temp_session_wm("monitors");
+        let mon = wm.monitors[0].handle;
+        let mut session = Session::default();
+        session.monitors.push(session::MonitorSession {
+            index: 1,
+            active_workspace: 3,
+            layout: "spiral".to_string(),
+        });
+        wm.load_session(session);
+        wm.apply_session();
+        assert_eq!(wm.layout_of(mon), LayoutKind::Spiral);
+        assert_eq!(wm.workspaces.active(mon), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn what_is_saved_is_what_gets_restored() {
+        // Save a session that carries a monitor's workspace, layout and a parked
+        // tree, then load it in a fresh manager and check the same state came
+        // back. This exercises the whole document round trip through JSON, which
+        // is the only way the save and restore halves are proven to agree.
+        let (mut source, path) = temp_session_wm("roundtrip");
+
+        let mon = source.monitors[0].handle;
+        source.layouts.insert(mon, LayoutKind::Grid);
+        source.workspaces.set_active(mon, 4);
+        source.set_master_ratio(mon, 4, 0.35);
+        let mut forest = Forest::default();
+        forest.activate(
+            &DwindleTree {
+                root: Some(Node::Split {
+                    horizontal: false,
+                    ratio: 0.3,
+                    a: Box::new(Node::Leaf { id: 7 }),
+                    b: Box::new(Node::Leaf { id: 9 }),
+                }),
+            },
+            4,
+        );
+        source.forests.insert(mon, forest);
+
+        let document = source.session_document();
+        document.write(&path).expect("the session is written");
+
+        // A fresh manager, as a restart would build.
+        let (mut restored, _) = temp_session_wm("roundtrip-target");
+        let loaded = Session::load(&path).expect("the session is read back");
+        let check = loaded.clone();
+        restored.load_session(loaded);
+        // Pretend both windows came back under their new ids.
+        restored.restored_ids.insert(7, 1);
+        restored.restored_ids.insert(9, 2);
+        // Install the trees first, before the retile that `apply_session` runs:
+        // with no live windows the retile would reconcile the slot against an
+        // empty window set and prune it, so the install is what proves the round
+        // trip.
+        restored.install_restored_trees(&check);
+        let mon = restored.monitors[0].handle;
+        let mut forest = restored.forests.get(&mon).cloned().unwrap_or_default();
+        assert_eq!(
+            forest.deactivate(4).root,
+            Some(Node::Split {
+                horizontal: false,
+                ratio: 0.3,
+                a: Box::new(Node::Leaf { id: 1 }),
+                b: Box::new(Node::Leaf { id: 2 }),
+            }),
+            "the split ratio and orientation survive the round trip, re-keyed"
+        );
+
+        restored.apply_session();
+        let mon = restored.monitors[0].handle;
+        assert_eq!(restored.layout_of(mon), LayoutKind::Grid);
+        assert_eq!(restored.workspaces.active(mon), 4);
+        assert!(
+            (restored.master_ratio_for(mon, 4) - 0.35).abs() < 1e-6,
+            "a master split widened by the user survives the round trip"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// A re-drop that follows a workspace switch happens while the window still
     /// sits at the drop-down rect, so the save must survive it. Without this,

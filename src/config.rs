@@ -184,6 +184,16 @@ pub struct Config {
     pub status_file: bool,
     /// Path of the status file. Empty means the default in the config directory.
     pub status_path: String,
+    /// Remember the arrangement across restarts: each window's workspace,
+    /// floating/fullscreen state and, for floating windows, its rectangle, plus
+    /// each monitor's active workspace, layout and the per-workspace split trees.
+    ///
+    /// The file is rewritten on every retile, so a crash still leaves a recent
+    /// session behind. Windows are matched by executable, class and title, since
+    /// an id is per-run and an HWND does not survive a restart.
+    pub persist_session: bool,
+    /// Path of the session file. Empty means `session.json` in the config directory.
+    pub session_path: String,
     /// Where to write the log. Empty means `hyprwin.log` in the config directory.
     ///
     /// The console is not a usable trail for a tray process, so every line is
@@ -223,6 +233,8 @@ impl Default for Config {
             rules: default_rules(),
             status_file: true,
             status_path: String::new(),
+            persist_session: true,
+            session_path: String::new(),
             log_path: String::new(),
             log_level: "info".to_string(),
         }
@@ -348,6 +360,19 @@ impl Config {
         let p = self.log_path.trim();
         if p.is_empty() {
             crate::log::default_path()
+        } else {
+            PathBuf::from(p)
+        }
+    }
+
+    /// Where the remembered session is written.
+    ///
+    /// Empty means `session.json` next to `config.json`. It is not written at all
+    /// when `persist_session` is false.
+    pub fn session_path(&self) -> PathBuf {
+        let p = self.session_path.trim();
+        if p.is_empty() {
+            Self::dir().join("session.json")
         } else {
             PathBuf::from(p)
         }
