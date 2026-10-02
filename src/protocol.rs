@@ -89,13 +89,14 @@ pub fn parse(line: &str) -> Result<Request, String> {
 
 /// Is this the action vocabulary `Wm::command` understands? Used to answer a
 /// typo with a useful error instead of a silent no-op.
-pub const ACTIONS: [&str; 14] = [
+pub const ACTIONS: [&str; 15] = [
     "focus",
     "move",
     "resize",
     "togglefloating",
     "fullscreen",
     "togglelayout",
+    "layout",
     "workspace",
     "movetoworkspace",
     "movetomonitor",
@@ -111,6 +112,7 @@ pub fn help() -> String {
     let mut s = String::from("hyprwinctl - drive a running HyprWin\n\nusage: hyprwinctl <command> [arg]\n\n");
     s.push_str("  status                     print status.json\n");
     s.push_str("  monitors                   print the per-monitor summary\n");
+    s.push_str("  clients                    print the managed-window list\n");
     s.push_str("  quit                       ask HyprWin to exit cleanly\n\n");
     s.push_str("window commands (act on the focused window):\n");
     for a in ACTIONS {
@@ -202,7 +204,8 @@ mod tests {
     #[test]
     fn the_advertised_actions_match_the_dispatcher() {
         // Guards against documenting an action the dispatcher does not know.
-        let source = include_str!("wm.rs");
+        // The dispatcher lives in the `commands` child of `wm`.
+        let source = include_str!("wm/commands.rs");
         for action in ACTIONS {
             assert!(
                 source.contains(&format!("\"{action}\" =>")),

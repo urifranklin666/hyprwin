@@ -5,8 +5,8 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, OBJID_WINDOW,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+    EVENT_SYSTEM_MOVESIZESTART, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 pub struct Hooks {
@@ -31,6 +31,7 @@ unsafe extern "system" fn callback(
         EVENT_SYSTEM_FOREGROUND => WinEvent::FocusChanged(hwnd.0 as isize),
         EVENT_SYSTEM_MINIMIZESTART => WinEvent::Minimized(hwnd.0 as isize),
         EVENT_SYSTEM_MINIMIZEEND => WinEvent::Restored(hwnd.0 as isize),
+        EVENT_SYSTEM_MOVESIZESTART => WinEvent::MoveSizeStart(hwnd.0 as isize),
         EVENT_SYSTEM_MOVESIZEEND => WinEvent::MoveSizeEnd(hwnd.0 as isize),
         _ => return,
     };
@@ -50,6 +51,7 @@ impl Hooks {
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_MINIMIZESTART,
             EVENT_SYSTEM_MINIMIZEEND,
+            EVENT_SYSTEM_MOVESIZESTART,
             EVENT_SYSTEM_MOVESIZEEND,
         ];
         for event in events {

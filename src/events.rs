@@ -19,6 +19,8 @@ pub enum WinEvent {
     FocusChanged(isize),
     Minimized(isize),
     Restored(isize),
+    /// The user began dragging or resizing a window.
+    MoveSizeStart(isize),
     /// The user finished dragging or resizing a window.
     MoveSizeEnd(isize),
 }

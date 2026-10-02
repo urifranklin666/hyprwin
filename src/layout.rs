@@ -346,6 +346,39 @@ impl DwindleTree {
             }
         }
     }
+
+    /// Like `layout`, but every split cuts on the same axis, so each window
+    /// takes a share of what is left and the panes nest inward instead of
+    /// alternating.
+    ///
+    /// It reuses the tree's stored ratios but ignores its stored `horizontal`
+    /// flags: the same tree therefore feeds both `dwindle` and `spiral`, and
+    /// switching between them does not reshape the split sizes.
+    pub fn layout_spiral(&self, area: Rect, gaps_outer: i32, gaps_inner: i32) -> Vec<(usize, Rect)> {
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            Self::walk_spiral(root, area.inset(gaps_outer, gaps_outer), &mut out);
+        }
+        if gaps_inner > 0 {
+            for (_, r) in out.iter_mut() {
+                *r = r.inset(gaps_inner / 2, gaps_inner / 2);
+            }
+        }
+        out
+    }
+
+    fn walk_spiral(node: &Node, area: Rect, out: &mut Vec<(usize, Rect)>) {
+        match node {
+            Node::Leaf { id } => out.push((*id, area)),
+            Node::Split { ratio, a, b, .. } => {
+                // Always the same axis, so the recursion carves nested vertical
+                // panes rather than alternating to horizontal ones.
+                let (ra, rb) = area.split_h(*ratio);
+                Self::walk_spiral(a, ra, out);
+                Self::walk_spiral(b, rb, out);
+            }
+        }
+    }
 }
 
 /// One dwindle tree per workspace on a monitor.
@@ -396,10 +429,15 @@ impl Forest {
 }
 
 /// Master/stack layout: one master pane on the left, the rest stacked right.
+///
+/// `masters` windows share the master column, stacked vertically among
+/// themselves; the remainder stack in a second column. A `masters` of 1 is the
+/// classic single-master look.
 pub fn tile_master(
     ids: &[usize],
     area: Rect,
     ratio: f32,
+    masters: u32,
     gaps_outer: i32,
     gaps_inner: i32,
 ) -> Vec<(usize, Rect)> {
@@ -408,15 +446,29 @@ pub fn tile_master(
     if ids.is_empty() {
         return out;
     }
+    // At least one window must stay in the stack column, or the master column
+    // would reserve room next to nothing at all.
+    let masters = (masters.max(1) as usize).min(ids.len().saturating_sub(1).max(1));
     if ids.len() == 1 {
         out.push((ids[0], inner));
     } else {
-        let (master, stack) = inner.split_h(ratio);
-        out.push((ids[0], master));
-        let n = ids.len() - 1;
+        let (master_area, stack) = inner.split_h(ratio);
+        // Stack the masters down the first column; a lone master fills it.
+        let master_h = master_area.h as f32 / masters as f32;
+        for i in 0..masters {
+            let y = master_area.y + (master_h * i as f32).round() as i32;
+            let hh = if i == masters - 1 {
+                master_area.bottom() - y
+            } else {
+                master_h.round() as i32
+            };
+            out.push((ids[i], Rect::new(master_area.x, y, master_area.w, hh.max(1))));
+        }
+        let n = ids.len() - masters;
         let h = stack.h as f32 / n as f32;
-        for (i, id) in ids.iter().enumerate().skip(1) {
-            let y = stack.y + (h * (i - 1) as f32).round() as i32;
+        for (i, id) in ids.iter().enumerate().skip(masters) {
+            let k = i - masters;
+            let y = stack.y + (h * k as f32).round() as i32;
             let hh = if i == ids.len() - 1 {
                 stack.bottom() - y
             } else {
@@ -433,19 +485,114 @@ pub fn tile_master(
     out
 }
 
+/// A single column: every window full width, stacked down the work area.
+pub fn tile_tall(
+    ids: &[usize],
+    area: Rect,
+    gaps_outer: i32,
+    gaps_inner: i32,
+) -> Vec<(usize, Rect)> {
+    let inner = area.inset(gaps_outer, gaps_outer);
+    let mut out = Vec::new();
+    if ids.is_empty() {
+        return out;
+    }
+    let n = ids.len();
+    let h = inner.h as f32 / n as f32;
+    for (i, id) in ids.iter().enumerate() {
+        let y = inner.y + (h * i as f32).round() as i32;
+        let hh = if i == n - 1 {
+            inner.bottom() - y
+        } else {
+            h.round() as i32
+        };
+        out.push((*id, Rect::new(inner.x, y, inner.w, hh.max(1))));
+    }
+    if gaps_inner > 0 {
+        for (_, r) in out.iter_mut() {
+            *r = r.inset(gaps_inner / 2, gaps_inner / 2);
+        }
+    }
+    out
+}
+
+/// An even grid, `ceil(sqrt(n))` columns wide, filled row by row.
+pub fn tile_grid(
+    ids: &[usize],
+    area: Rect,
+    gaps_outer: i32,
+    gaps_inner: i32,
+) -> Vec<(usize, Rect)> {
+    let inner = area.inset(gaps_outer, gaps_outer);
+    let mut out = Vec::new();
+    if ids.is_empty() {
+        return out;
+    }
+    let n = ids.len();
+    let cols = (n as f64).sqrt().ceil().max(1.0) as usize;
+    let rows = n.div_ceil(cols);
+    let ch = inner.h as f32 / rows as f32;
+    for (i, id) in ids.iter().enumerate() {
+        let r = i / cols;
+        let c = i % cols;
+        // The final row can be short. Let its windows share the full width
+        // rather than leave a hole where the missing columns would have been,
+        // which also means the grid always reaches the far edge.
+        let in_row = (n - r * cols).min(cols);
+        let cw = inner.w as f32 / in_row as f32;
+        let x = inner.x + (cw * c as f32).round() as i32;
+        let w = if c == in_row - 1 {
+            inner.right() - x
+        } else {
+            cw.round() as i32
+        };
+        let y = inner.y + (ch * r as f32).round() as i32;
+        let h = if r == rows - 1 {
+            inner.bottom() - y
+        } else {
+            ch.round() as i32
+        };
+        out.push((*id, Rect::new(x, y, w.max(1), h.max(1))));
+    }
+    if gaps_inner > 0 {
+        for (_, r) in out.iter_mut() {
+            *r = r.inset(gaps_inner / 2, gaps_inner / 2);
+        }
+    }
+    out
+}
+
+/// Every window fills the work area, in `ids` order.
+///
+/// The last id in `ids` is the one to raise: `retile_monitor` moves windows in
+/// order, so the final `SetWindowPos` is the topmost.
+pub fn tile_stacking(ids: &[usize], area: Rect, gaps_outer: i32) -> Vec<(usize, Rect)> {
+    let inner = area.inset(gaps_outer, gaps_outer);
+    ids.iter().map(|id| (*id, inner)).collect()
+}
+
 /// Dispatch to the configured algorithm.
+///
+/// `order` is the master/stack order for `master`; the dwindle tree supplies
+/// every other arrangement. `masters` is `master_count` and is ignored by the
+/// other kinds.
 pub fn compute(
     kind: LayoutKind,
     tree: &DwindleTree,
     order: &[usize],
     area: Rect,
     ratio: f32,
+    masters: u32,
     gaps_outer: i32,
     gaps_inner: i32,
 ) -> Vec<(usize, Rect)> {
     match kind {
         LayoutKind::Dwindle => tree.layout(area, gaps_outer, gaps_inner),
-        LayoutKind::Master => tile_master(order, area, ratio, gaps_outer, gaps_inner),
+        LayoutKind::Master => tile_master(order, area, ratio, masters, gaps_outer, gaps_inner),
+        LayoutKind::Spiral => tree.layout_spiral(area, gaps_outer, gaps_inner),
+        LayoutKind::Tall => tile_tall(order, area, gaps_outer, gaps_inner),
+        LayoutKind::Grid => tile_grid(order, area, gaps_outer, gaps_inner),
+        LayoutKind::Stacking => tile_stacking(order, area, gaps_outer),
     }
 }
 
@@ -770,13 +917,13 @@ mod tests {
 
     #[test]
     fn master_layout_puts_one_window_full_width() {
-        let r = tile_master(&[1], FULL, 0.6, 0, 0);
+        let r = tile_master(&[1], FULL, 0.6, 1, 0, 0);
         assert_eq!(r[0].1, FULL);
     }
 
     #[test]
     fn master_layout_stacks_the_remainder() {
-        let r = tile_master(&[1, 2, 3], FULL, 0.6, 0, 0);
+        let r = tile_master(&[1, 2, 3], FULL, 0.6, 1, 0, 0);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0].1.w, 1152);
         assert_eq!(r[1].1.x, 1152);
@@ -786,8 +933,89 @@ mod tests {
     }
 
     #[test]
+    fn two_masters_split_the_first_column_between_them() {
+        let r = tile_master(&[1, 2, 3], FULL, 0.5, 2, 0, 0);
+        // Window 1 and 2 share the master column (0..960), window 3 takes the
+        // whole stack column.
+        assert_eq!(r[0].1, Rect::new(0, 0, 960, 540));
+        assert_eq!(r[1].1, Rect::new(0, 540, 960, 540));
+        assert_eq!(r[2].1, Rect::new(960, 0, 960, 1080));
+    }
+
+    #[test]
+    fn more_masters_than_windows_never_empties_the_stack() {
+        // Asking for 4 masters with 2 windows must clamp to 2, never reserving a
+        // master column with nothing in it.
+        let r = tile_master(&[1, 2], FULL, 0.5, 4, 0, 0);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].1.w, 960);
+        assert_eq!(r[1].1.w, 960);
+        assert_eq!(r[1].1.x, 960);
+    }
+
+    #[test]
+    fn tall_layout_is_one_full_width_column() {
+        let r = tile_tall(&[1, 2, 3], FULL, 0, 0);
+        assert_eq!(r.len(), 3);
+        for (_, rect) in &r {
+            assert_eq!(rect.x, 0);
+            assert_eq!(rect.w, 1920, "every window spans the full width");
+        }
+        assert_eq!(r[0].1.h, 360);
+        assert_eq!(r[2].1.bottom(), 1080, "the last window reaches the bottom");
+    }
+
+    #[test]
+    fn grid_uses_a_square_column_count_and_covers_the_area() {
+        // Four windows make a 2x2 grid.
+        let r = tile_grid(&[1, 2, 3, 4], FULL, 0, 0);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0].1, Rect::new(0, 0, 960, 540));
+        assert_eq!(r[3].1, Rect::new(960, 540, 960, 540));
+        // Five windows make a 3-wide grid, so the second row is partly empty and
+        // the last placed cell still reaches the far edge.
+        let r = tile_grid(&[1, 2, 3, 4, 5], FULL, 0, 0);
+        assert_eq!(r.len(), 5);
+        assert_eq!(r[4].1.right(), 1920, "the grid reaches the right edge");
+    }
+
+    #[test]
+    fn stacking_puts_every_window_at_the_same_rect() {
+        let r = tile_stacking(&[1, 2, 3], FULL, 0);
+        assert_eq!(r.len(), 3);
+        assert!(r.iter().all(|(_, rect)| *rect == FULL));
+    }
+
+    #[test]
+    fn spiral_cuts_every_split_on_the_same_axis() {
+        // The dwindle tree alternates: window 3 sits to the right of window 2 and
+        // below it. Spiral keeps cutting horizontally, so window 3 stays to the
+        // right instead — a visibly different arrangement from the same tree.
+        let mut t = DwindleTree::default();
+        t.insert(1, None);
+        t.insert(2, Some(1));
+        t.insert(3, Some(2));
+        let by_id = |r: Vec<(usize, Rect)>, id: usize| {
+            r.iter().find(|(i, _)| *i == id).unwrap().1
+        };
+        let dwindle = t.layout(FULL, 0, 0);
+        let spiral = t.layout_spiral(FULL, 0, 0);
+        assert_eq!(by_id(dwindle.clone(), 2), Rect::new(960, 0, 960, 540));
+        // Spiral: window 1 half, window 2 half of the remainder, window 3 the rest.
+        assert_eq!(by_id(spiral.clone(), 2).h, 1080, "no vertical cut is made");
+        assert_eq!(by_id(spiral, 3).x, 1440, "window 3 sits fully to the right");
+        // Both place every window and stay in bounds.
+        for kind in [dwindle, t.layout_spiral(FULL, 8, 6)] {
+            assert_eq!(kind.len(), 3);
+            for (_, r) in kind {
+                assert!(!r.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn master_layout_covers_the_whole_area() {
-        let r = tile_master(&[1, 2, 3, 4], FULL, 0.5, 8, 6);
+        let r = tile_master(&[1, 2, 3, 4], FULL, 0.5, 1, 8, 6);
         for (_, rect) in &r {
             assert!(!rect.is_empty());
             assert!(rect.x >= 8 && rect.y >= 8);
@@ -842,10 +1070,21 @@ mod tests {
         t.insert(1, None);
         t.insert(2, Some(1));
         let (go, gi) = no_gaps();
-        let dwindle = compute(LayoutKind::Dwindle, &t, &[1, 2], FULL, 0.6, go, gi);
-        let master = compute(LayoutKind::Master, &t, &[1, 2], FULL, 0.6, go, gi);
+        let dwindle = compute(LayoutKind::Dwindle, &t, &[1, 2], FULL, 0.6, 1, go, gi);
+        let master = compute(LayoutKind::Master, &t, &[1, 2], FULL, 0.6, 1, go, gi);
         assert_eq!(dwindle.len(), 2);
         assert_eq!(master[0].1.w, 1152);
+        // Every kind must place the same ids exactly once and stay in bounds, so
+        // a caller can switch between them without special-casing one.
+        for kind in LayoutKind::CYCLE {
+            let r = compute(kind, &t, &[1, 2], FULL, 0.6, 1, go, gi);
+            assert_eq!(r.len(), 2, "{kind:?} must place both windows");
+            for (_, rect) in &r {
+                assert!(!rect.is_empty(), "{kind:?} produced an empty rect");
+                assert!(rect.x >= 0 && rect.y >= 0);
+                assert!(rect.right() <= FULL.right() && rect.bottom() <= FULL.bottom());
+            }
+        }
     }
 
     #[test]

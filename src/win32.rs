@@ -4,13 +4,13 @@
 //! tiling logic lives in `layout.rs` and `wm.rs` so it stays testable.
 
 use crate::layout::Rect;
-use std::time::{Duration, Instant};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, FALSE, HANDLE, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CLOAKED,
     DWMWA_WINDOW_CORNER_PREFERENCE,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -39,6 +39,18 @@ pub fn is_window(hwnd: HWND) -> bool {
 
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
+}
+
+/// The local wall-clock time as `YYYY-MM-DD HH:MM:SS`, for log lines.
+///
+/// Built here rather than in `log` because the only clock HyprWin can read is
+/// Win32's, and formatting it as a string is where the platform detail lives.
+pub fn local_timestamp() -> String {
+    let st = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
 }
 
 pub fn is_minimized(hwnd: HWND) -> bool {
@@ -269,44 +281,13 @@ pub fn hide(hwnd: HWND) {
     }
 }
 
-/// Move every window in `moves` to its target, sharing one eased frame loop.
+/// Apply one frame of a stepped animation.
 ///
-/// Animating in lockstep costs one duration in total rather than one duration
-/// per window, which is what keeps a workspace switch feeling snappy.
-pub fn animate_batch(moves: &[(HWND, Rect)], duration_ms: u32, easing: &str) {
-    if moves.is_empty() {
-        return;
-    }
-    if duration_ms == 0 {
-        for (h, r) in moves {
-            set_pos(*h, *r);
-        }
-        return;
-    }
-    let froms: Vec<Rect> = moves
-        .iter()
-        .map(|(h, _)| rect_of(*h).unwrap_or_default())
-        .collect();
-    let frame_ms = 8u32;
-    let frames = crate::animation::frame_count(duration_ms, frame_ms);
-    let start = Instant::now();
-    let total = (duration_ms as f32 / 1000.0).max(0.001);
-    for i in 1..=frames {
-        let t = if i == frames {
-            1.0
-        } else {
-            start.elapsed().as_secs_f32() / total
-        };
-        let eased = crate::animation::ease(easing, t);
-        for ((h, to), from) in moves.iter().zip(froms.iter()) {
-            set_pos(*h, crate::animation::lerp_rect(*from, *to, eased));
-        }
-        if i != frames {
-            std::thread::sleep(Duration::from_millis(frame_ms as u64));
-        }
-    }
-    for (h, r) in moves {
-        set_pos(*h, *r);
+/// The caller drives the clock; this only turns a `(handle, rect)` pair back
+/// into a window move, so a whole batch can be advanced without owning the loop.
+pub fn set_pos_tween(frames: &[(isize, Rect)]) {
+    for (h, r) in frames {
+        set_pos(hwnd_from(*h), *r);
     }
 }
 

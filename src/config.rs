@@ -4,16 +4,67 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Tiling layout algorithm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LayoutKind {
+    /// Recursive halving; a new window splits the focused one.
     Dwindle,
+    /// One master pane on the left, the rest stacked on the right.
     Master,
+    /// Recursive halving in one direction, so the panes spiral inward.
+    Spiral,
+    /// A single column, every window full width.
+    Tall,
+    /// An even grid of cells, `ceil(sqrt(n))` columns wide.
+    Grid,
+    /// Every window fills the work area; the focused one is on top.
+    Stacking,
 }
 
 impl Default for LayoutKind {
     fn default() -> Self {
         LayoutKind::Dwindle
+    }
+}
+
+impl LayoutKind {
+    /// The order `layout` cycles through when it is given no argument.
+    pub const CYCLE: [LayoutKind; 6] = [
+        LayoutKind::Dwindle,
+        LayoutKind::Master,
+        LayoutKind::Spiral,
+        LayoutKind::Tall,
+        LayoutKind::Grid,
+        LayoutKind::Stacking,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dwindle" => Some(LayoutKind::Dwindle),
+            "master" => Some(LayoutKind::Master),
+            "spiral" => Some(LayoutKind::Spiral),
+            "tall" | "columns" => Some(LayoutKind::Tall),
+            "grid" => Some(LayoutKind::Grid),
+            "stacking" | "stack" => Some(LayoutKind::Stacking),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LayoutKind::Dwindle => "dwindle",
+            LayoutKind::Master => "master",
+            LayoutKind::Spiral => "spiral",
+            LayoutKind::Tall => "tall",
+            LayoutKind::Grid => "grid",
+            LayoutKind::Stacking => "stacking",
+        }
+    }
+
+    /// The next layout in `CYCLE`.
+    pub fn next(self) -> Self {
+        let i = Self::CYCLE.iter().position(|k| *k == self).unwrap_or(0);
+        Self::CYCLE[(i + 1) % Self::CYCLE.len()]
     }
 }
 
@@ -39,7 +90,7 @@ impl Direction {
 }
 
 /// A single keybinding. `action` is a command name, `arg` its optional parameter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keybind {
     #[serde(default)]
     pub mods: Vec<String>,
@@ -116,6 +167,17 @@ pub struct Config {
     pub default_layout: LayoutKind,
     /// Master area share for the "master" layout, 0.1..0.9.
     pub master_ratio: f32,
+    /// How many windows hold a master pane in the "master" layout.
+    pub master_count: u32,
+    /// Per-workspace master-ratio override, keyed by workspace number. A
+    /// workspace with no entry uses `master_ratio`; resizing the master split
+    /// while in the `master` layout updates the working copy at runtime.
+    pub master_ratios: std::collections::HashMap<String, f32>,
+    /// Per-monitor layout, overriding `default_layout`. Keys are monitor
+    /// numbers (1-based, primary first), the same numbers a `monitor` rule uses;
+    /// a monitor with no entry uses `default_layout`. This is a deliberate start
+    /// rather than dynamic memory so there is no new file to keep in sync.
+    pub layouts: std::collections::HashMap<String, LayoutKind>,
     /// Re-tile all currently open windows on startup. When false, HyprWin only
     /// takes over windows that appear after it starts.
     pub manage_on_start: bool,
@@ -127,6 +189,15 @@ pub struct Config {
     pub status_file: bool,
     /// Path of the status file. Empty means the default in the config directory.
     pub status_path: String,
+    /// Where to write the log. Empty means `hyprwin.log` in the config directory.
+    ///
+    /// The console is not a usable trail for a tray process, so every line is
+    /// also appended here. The file is rotated once, to `.old`, when it grows
+    /// past a megabyte.
+    pub log_path: String,
+    /// Minimum level logged to console and file: "error" | "warn" | "info" |
+    /// "debug" | "off".
+    pub log_level: String,
 }
 
 impl Default for Config {
@@ -148,12 +219,17 @@ impl Default for Config {
             workspaces: 9,
             default_layout: LayoutKind::Dwindle,
             master_ratio: 0.6,
+            master_count: 1,
+            master_ratios: std::collections::HashMap::new(),
+            layouts: std::collections::HashMap::new(),
             manage_on_start: true,
             autostart: false,
             keybinds: default_keybinds(),
             rules: default_rules(),
             status_file: true,
             status_path: String::new(),
+            log_path: String::new(),
+            log_level: "info".to_string(),
         }
     }
 }
@@ -272,6 +348,16 @@ impl Config {
         }
     }
 
+    /// Where the log is written. Empty means `hyprwin.log` beside the config.
+    pub fn log_path(&self) -> PathBuf {
+        let p = self.log_path.trim();
+        if p.is_empty() {
+            crate::log::default_path()
+        } else {
+            PathBuf::from(p)
+        }
+    }
+
     /// Load the config, writing a default file on first run.
     pub fn load_or_create() -> Result<Self> {
         let path = Self::path();
@@ -316,6 +402,26 @@ impl Config {
             "master_ratio must be between 0.1 and 0.9"
         );
         anyhow::ensure!(
+            self.master_count >= 1,
+            "master_count must be at least 1"
+        );
+        for key in self.layouts.keys() {
+            anyhow::ensure!(
+                key.trim().parse::<usize>().map(|n| n >= 1).unwrap_or(false),
+                "layouts keys must be monitor numbers like \"1\", got {key:?}"
+            );
+        }
+        for (key, ratio) in &self.master_ratios {
+            anyhow::ensure!(
+                key.trim().parse::<usize>().map(|n| n >= 1).unwrap_or(false),
+                "master_ratios keys must be workspace numbers like \"1\", got {key:?}"
+            );
+            anyhow::ensure!(
+                *ratio > 0.1 && *ratio < 0.9,
+                "master_ratios[{key:?}] must be between 0.1 and 0.9"
+            );
+        }
+        anyhow::ensure!(
             matches!(
                 self.main_mod.trim().to_ascii_lowercase().as_str(),
                 "alt" | "ctrl" | "control" | "shift" | "win" | "super" | "meta"
@@ -328,6 +434,10 @@ impl Config {
                 "linear" | "quad" | "cubic" | "expo"
             ),
             "animation_easing must be linear, quad, cubic or expo"
+        );
+        anyhow::ensure!(
+            crate::log::Level::parse(&self.log_level).is_some(),
+            "log_level must be error, warn, info, debug or off"
         );
         for rule in &self.rules {
             if rule.action == "float" {
@@ -433,6 +543,72 @@ mod tests {
         let mut c = Config::default();
         c.master_ratio = 0.95;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_master_ratio_override_is_validated_per_workspace() {
+        let mut c = Config::default();
+        // A sensible per-workspace ratio is accepted.
+        c.master_ratios.insert("3".to_string(), 0.7);
+        assert!(c.validate().is_ok());
+        // Its key must be a workspace number, and its value within the range.
+        c.master_ratios.insert("left".to_string(), 0.5);
+        assert!(c.validate().is_err(), "a non-numeric workspace key is rejected");
+        c.master_ratios.remove("left");
+        c.master_ratios.insert("3".to_string(), 0.99);
+        assert!(c.validate().is_err(), "an out-of-range ratio is rejected");
+    }
+
+    #[test]
+    fn keybinds_compare_by_value_so_a_reload_can_tell_they_changed() {
+        // `reload` re-registers the global hotkeys only when the parsed bindings
+        // actually differ; the comparison has to see a changed key, modifier,
+        // action and argument alike.
+        let base = vec![
+            Keybind {
+                mods: vec!["main".to_string()],
+                key: "Q".to_string(),
+                action: "close".to_string(),
+                arg: None,
+            },
+            Keybind {
+                mods: vec!["main".to_string(), "shift".to_string()],
+                key: "1".to_string(),
+                action: "movetoworkspace".to_string(),
+                arg: Some("1".to_string()),
+            },
+        ];
+        assert_eq!(base.clone(), base.clone(), "an identical set is equal");
+
+        let mut other_key = base.clone();
+        other_key[0].key = "W".to_string();
+        assert_ne!(base, other_key, "a changed key must be noticed");
+
+        let mut other_mods = base.clone();
+        other_mods[0].mods = vec!["main".to_string(), "ctrl".to_string()];
+        assert_ne!(base, other_mods, "a changed modifier must be noticed");
+
+        let mut other_arg = base.clone();
+        other_arg[1].arg = Some("2".to_string());
+        assert_ne!(base, other_arg, "a changed argument must be noticed");
+    }
+
+    #[test]
+    fn a_bad_log_level_is_rejected_but_off_is_allowed() {
+        let mut c = Config::default();
+        c.log_level = "verbose".to_string();
+        assert!(c.validate().is_err());
+        c.log_level = "off".to_string();
+        assert!(c.validate().is_ok(), "`off` is a deliberate choice, not a typo");
+    }
+
+    #[test]
+    fn the_log_path_defaults_next_to_the_config() {
+        let c = Config::default();
+        assert_eq!(c.log_path(), Config::dir().join("hyprwin.log"));
+        let mut c = Config::default();
+        c.log_path = "D:\\logs\\hyprwin.log".to_string();
+        assert_eq!(c.log_path(), PathBuf::from("D:\\logs\\hyprwin.log"));
     }
 
     #[test]

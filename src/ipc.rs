@@ -97,7 +97,7 @@ fn listen(path: String, control: Arc<Mutex<Control>>) {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            eprintln!("[hyprwin] control pipe could not be created; control is disabled");
+            crate::log_error!("[hyprwin] control pipe could not be created; control is disabled");
             return;
         }
         unsafe {

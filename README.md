@@ -13,7 +13,7 @@ komorebi and GlazeWM, and it is the only model Windows permits.
 
 ## Status
 
-Working, verified by the unit suite (`105 passed`), a clean release build and a
+Working, verified by the unit suite (`125 passed`), a clean release build and a
 live run against a two-monitor desktop. See
 [Manual smoke test](#manual-smoke-test) for the checklist to run yourself.
 
@@ -21,10 +21,11 @@ live run against a two-monitor desktop. See
 
 | Feature | Notes |
 |---|---|
-| Dynamic tiling | Dwindle (spiral) and master/stack layouts |
+| Dynamic tiling | Six layouts: `dwindle`, `spiral`, `master`, `tall`, `grid` and `stacking`; switch per monitor with the `layout` command |
 | Minimized windows leave the layout | Minimizing reflows the other windows to fill the gap; restoring puts the window back in the slot it had |
 | Maximized windows are re-tiled | A window maximised after it was adopted is un-maximised on the next retile instead of sitting zoomed over its tile |
-| Persistent split ratios | Resizing one split survives retiling; other windows do not jump |
+| Persistent split ratios | Resizing one split survives retiling; the master ratio is remembered **per workspace**, so a width set on workspace 3 does not bleed into workspace 4 |
+| Drag to rearrange | Dragging a tiled window's title bar across the desktop moves it to that monitor; dropping it on a neighbour swaps the two; dragging a border resizes the split. Floating windows are left alone |
 | Per-workspace layout memory | Leaving a workspace parks its dwindle tree, so windows return to the position they had |
 | Clean exit | Quitting un-hides windows parked on other workspaces and restores their original geometry, including whether each was maximized when HyprWin adopted it |
 | Gaps | Configurable outer (edge) and inner (between windows) |
@@ -34,11 +35,12 @@ live run against a two-monitor desktop. See
 | Scratchpad | A drop-down window over whatever workspace you are on, hideable with one key and reachable from any workspace |
 | Move between monitors | `movetomonitor` sends the focused window to the other display |
 | Keyboard escape from an empty workspace | On a monitor showing nothing, a workspace switch or scratchpad toggle follows the mouse instead of always hitting the primary display |
-| Keybinds | Configurable, with a `main` placeholder for the primary modifier |
+| Keybinds | Configurable, with a `main` placeholder for the primary modifier; reloading re-registers changed bindings without a restart |
 | Window rules | Match exe / class / title, then float (optionally by size), ignore, pin to a workspace, or send to a monitor or the scratchpad |
 | Status output | Writes `status.json` (active workspace, layout, focus, window counts, work areas) for a Rainmeter skin or any other dashboard to read |
-| Control interface | `hyprwinctl` drives a running instance over a named pipe: switch workspace, toggle tiling, reload, query status |
-| Animations | Eased interpolation of moves and resizes (best effort) |
+| Control interface | `hyprwinctl` drives a running instance over a named pipe: switch workspace, set layout, toggle tiling, reload, list clients, query status |
+| Animations | Eased interpolation of moves and resizes, stepped from the message loop so a keypress is answered mid-animation rather than after it |
+| Log file | Every milestone and failure is appended to `hyprwin.log` beside the config (a tray process has no usable console), rotated once at 1 MiB, at a configurable level |
 | Tray icon | Reload config / toggle tiling / quit |
 | Autostart | Optional `HKCU\...\Run` registration |
 | Multi-monitor | Per-monitor workspaces, hot-plug re-detection, per-monitor DPI awareness; windows are assigned by greatest overlap with a monitor |
@@ -106,7 +108,7 @@ Quit from the tray icon, or with `Ctrl+C` in the console.
 | `main` + `Ctrl` + `H/J/K/L` | Resize the nearest split |
 | `main` + `V` | Toggle floating |
 | `main` + `F` | Toggle fullscreen |
-| `main` + `Space` | Toggle dwindle / master layout |
+| `main` + `Space` | Cycle the layout (dwindle → spiral → master → tall → grid → stacking) |
 | `main` + `Q` | Close the focused window |
 | `main` + `R` | Reload `config.json` |
 | `main` + `1`..`9` | Switch to workspace 1..9 |
@@ -167,11 +169,16 @@ the documented default.
   "animation_easing": "cubic",
   "workspaces": 9,
   "default_layout": "dwindle",
+  "layouts": {},
   "master_ratio": 0.6,
+  "master_count": 1,
+  "master_ratios": {},
   "manage_on_start": true,
   "autostart": false,
   "status_file": true,
   "status_path": "",
+  "log_path": "",
+  "log_level": "info",
   "keybinds": [],
   "rules": []
 }
@@ -192,12 +199,36 @@ the documented default.
 | `animation_ms` | Duration; `0` disables animation |
 | `animation_easing` | `linear`, `quad`, `cubic` or `expo` |
 | `workspaces` | Workspaces per monitor, 1–36 |
-| `default_layout` | `dwindle` or `master` |
-| `master_ratio` | Master share for `master` layout, between 0.1 and 0.9 |
+| `default_layout` | Starting layout per monitor: `dwindle`, `spiral`, `master`, `tall`, `grid` or `stacking` |
+| `layouts` | Per-monitor layout override, keyed by monitor number (`"1"`, `"2"`, … primary first); a monitor with no entry uses `default_layout` |
+| `master_ratio` | Master share for the `master` layout, between 0.1 and 0.9 |
+| `master_count` | How many windows hold a master pane in the `master` layout (default 1) |
+| `master_ratios` | Per-workspace master-ratio override, keyed by workspace number; written at runtime when you resize the master split, so a width set on one workspace is not lost |
 | `manage_on_start` | Adopt already-open windows on startup; when `false`, only windows that appear after startup are tiled |
 | `autostart` | Register the binary in `HKCU\...\Run` |
 | `status_file` | Write the status document described below |
 | `status_path` | Where to write it; empty means `status.json` beside `config.json` |
+| `log_path` | Where to write the log; empty means `hyprwin.log` beside `config.json` |
+| `log_level` | `error`, `warn`, `info`, `debug` or `off` |
+
+### Layouts
+
+Six arrangements, selected per monitor. `togglelayout` cycles them; `layout
+<name>` sets one on every monitor, and `layout next` / `layout prev` step the
+focused monitor.
+
+| Layout | What it does |
+|---|---|
+| `dwindle` | Recursive split, alternating horizontal/vertical at each level (the classic Hyprland default) |
+| `spiral` | Same recursive split, but every cut is on one axis, so panes nest inward |
+| `master` | `master_count` windows share the first column; the rest stack in a second |
+| `tall` | One column: every window full width, stacked down the work area |
+| `grid` | An even grid, `ceil(sqrt(n))` columns wide |
+| `stacking` | Every window fills the work area; the focused one is raised |
+
+Resizing with `main`+`Ctrl`+arrows adjusts a dwindle/spiral split, and — in the
+`master` layout, where the split is not in the tree — moves the master ratio for
+the current workspace, remembered in `master_ratios`.
 
 ### Keybinds
 
@@ -213,8 +244,14 @@ the documented default.
 `mods` accepts `main`, `alt`, `ctrl`, `shift`, `win`. `key` is a single
 character (`1`, `Q`), a named key (`Left`, `Space`, `Tab`, `PageUp`, `F1`–`F24`)
 or a punctuation key. Actions are `focus`, `move`, `resize`, `togglefloating`,
-`fullscreen`, `togglelayout`, `workspace`, `movetoworkspace`, `movetomonitor`,
-`scratchpad`, `movetoscratchpad`, `close` and `reload`.
+`fullscreen`, `togglelayout`, `layout`, `workspace`, `movetoworkspace`,
+`movetomonitor`, `scratchpad`, `movetoscratchpad`, `close` and `reload`.
+
+`main` + `R` (or `hyprwinctl reload`) re-reads the config. A changed keybind set
+is handed to Windows again — the old bindings are unregistered first, so an
+action you deleted stops firing — and a changed `log_level` retunes the log sink.
+A changed `main_mod` needs a restart, since the modifier under every existing
+binding cannot be swapped in place; HyprWin logs a warning saying so.
 
 `movetomonitor` takes `next`, `prev`, or a monitor named by index (`1`, `2`,
 primary first) or `primary`. Workspace numbers are per-monitor, so a window sent
@@ -295,7 +332,9 @@ named pipe and exits with a status a script can check.
 ```sh
 hyprwinctl status              # the status document, as status.json holds it
 hyprwinctl monitors            # one line per monitor
+hyprwinctl clients             # one line per managed window
 hyprwinctl workspace 3         # switch the focused monitor to workspace 3
+hyprwinctl layout grid         # set the layout (or `layout next` to cycle)
 hyprwinctl togglelayout
 hyprwinctl reload
 hyprwinctl quit                # ask HyprWin to exit cleanly
@@ -304,8 +343,8 @@ hyprwinctl quit                # ask HyprWin to exit cleanly
 Anything else is passed to the same dispatcher the keybinds use, so the
 vocabulary is exactly the keybind action list — `focus left`, `movetomonitor
 next`, `movetoscratchpad`, `toggletiling`, and so on — plus `status`,
-`monitors` and `quit`. A successful command echoes what it ran; an unknown one
-prints `unknown action '...'` and exits `1`.
+`monitors`, `clients` and `quit`. A successful command echoes what it ran; an
+unknown one prints `unknown action '...'` and exits `1`.
 
 The pipe is `\\.\pipe\hyprwin` (one instance per user session) and speaks a
 single line per request. A reply is tagged `OK`, `DATA` or `ERR`, followed by
@@ -319,20 +358,39 @@ Requests are answered in order and a client that hangs up is simply dropped.
 
 ---
 
+## Log file
+
+A process started from the tray or a `Run` key has no usable console, so every
+milestone and failure is also appended to `hyprwin.log` beside `config.json`
+(or `log_path`). Startup, keybind registrations refused by Windows, config
+errors, reloads and shutdown all leave a line. The file is rotated once, to
+`.log.old`, when it passes a megabyte, so it cannot grow without bound.
+
+Set `log_level` to `debug` for per-event detail, or `off` to silence the file
+entirely. Before the logger is initialised — a config that fails to load — there
+is no file to write to, so those lines go to the console (and, on a windowless
+run, nowhere).
+
+---
+
 ## Architecture
 
 | Module | Responsibility |
 |---|---|
 | `main.rs` | Startup, message loop, wiring |
-| `wm.rs` | The state machine: tiling, focus, workspaces, commands |
-| `layout.rs` | Dwindle tree, per-workspace forest, master/stack, gaps, geometric neighbour search |
+| `wm.rs` | The state machine: the manager struct, windows, retiling, scratchpad |
+| `wm/commands.rs` | The command vocabulary: the dispatcher and its handlers |
+| `wm/borders.rs` | The focused-tile accent: DWM line, overlay frames, cross-fade |
+| `wm/status.rs` | Building the status document from live state |
+| `layout.rs` | Dwindle tree, per-workspace forest, the six layout algorithms, gaps, geometric neighbour search |
 | `workspace.rs` | Per-monitor workspaces, floating/fullscreen bookkeeping |
 | `win32.rs` | FFI wrappers: window queries, `SetWindowPos`, DWM attributes |
 | `hook.rs` | `SetWinEventHook` callbacks |
 | `hotkey.rs` | `RegisterHotKey` and keybind parsing |
 | `monitor.rs` | `EnumDisplayMonitors`, work areas |
-| `animation.rs` | Easing curves and interpolation (pure, tested) |
+| `animation.rs` | Easing curves, interpolation, and the stepped `Tween` (pure, tested) |
 | `config.rs` | Config structs, defaults, validation, colour parsing |
+| `log.rs` | The file logger and its rotation |
 | `tray.rs` | Tray icon and menu |
 | `autostart.rs` | `HKCU\...\Run` helper |
 | `status.rs` | The `status.json` document and its atomic write |
@@ -357,6 +415,12 @@ Three design points worth knowing:
   again, and it is why the scratchpad stays tiled rather than floating while it
   is down: a floating window is skipped by every retile, so nothing would put it
   back in place.
+- **Animations are stepped, not slept through.** A move holds a `Tween` (the
+  from/to rectangles and a clock) and the message loop advances it with
+  `Wm::tick`, using the next frame's delay as its idle wait. Blocking inside the
+  animation would stall keybinds until it finished; stepping keeps the loop
+  answering input between frames, and all monitors in one retile share a single
+  tween so the desktop lands together.
 
 ## Manual smoke test
 
@@ -406,6 +470,21 @@ Run `target\release\hyprwin.exe`, then check:
     an empty workspace. Put the mouse on that display and press `Alt+2`: the
     **second** monitor switches, not the primary. `Alt+1` brings it back. With
     the pointer on the primary instead, the chord acts there.
+24. Cycle the layouts: `hyprwinctl layout next` steps through dwindle, spiral,
+    master, tall, grid and stacking; `hyprwinctl layout grid` sets one on every
+    monitor. In `master`, `Alt+Ctrl+L` widens the master column, `Alt+2` then
+    `Alt+1` returns to the widened column, and workspace 2 keeps its own width.
+25. Drag a tiled window by its title bar onto the other monitor — it moves there
+    and both monitors re-tile. Drag one onto a neighbour and release — they swap
+    places. Drag a window's edge a short distance — the split resizes. Drag a
+    window a few pixels and let go — it snaps back where it was.
+26. Open a second window, start a workspace switch (`Alt+2`) with a long
+    `animation_ms`, and press `Alt+1` while the windows are still sliding: the
+    keypress is answered mid-animation rather than after it.
+27. Edit a keybind in `%APPDATA%\hyprwin\config.json`, `Alt+R`, and confirm the
+    old chord no longer fires and the new one does — without restarting.
+28. Read `%APPDATA%\hyprwin\hyprwin.log` after a reload or a refused binding —
+    the lines are there, and `log_level: "debug"` adds more.
 
 ## License
 

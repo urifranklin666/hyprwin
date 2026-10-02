@@ -14,6 +14,13 @@ use std::collections::HashMap;
 use std::time::Instant;
 use windows::Win32::Foundation::HWND;
 
+// The manager is large enough to read best in parts. Each child reaches the
+// private state above with `use super::*`, so splitting it moves code without
+// widening any visibility.
+mod borders;
+mod commands;
+mod status;
+
 /// Share of the work area the scratchpad covers when it drops down.
 const SCRATCHPAD_FRACTION: f32 = 0.7;
 
@@ -39,7 +46,11 @@ pub struct ManagedWindow {
 
 pub struct Wm {
     pub cfg: Config,
-    pub layout_kind: LayoutKind,
+    /// Layout for each monitor, keyed by handle. Seeded from `default_layout`
+    /// and the per-monitor `layouts` map, then moved by the `layout` command.
+    /// Kept separate from `cfg` because the command changes it without writing
+    /// the config back, the same way the layout survives a reload by default.
+    pub layouts: HashMap<isize, LayoutKind>,
     pub workspaces: WorkspaceState,
     /// Monitors, refreshed whenever the display set changes.
     pub monitors: Vec<Monitor>,
@@ -66,6 +77,51 @@ pub struct Wm {
     /// built for. Reused as the "from" side of a focus cross-fade.
     last_frames: Vec<crate::overlay::Frame>,
     last_focus: Option<isize>,
+    /// An in-flight window move. Stepped by `tick` from the message loop rather
+    /// than slept through here, so a keybind still answers mid-animation.
+    tween: Option<crate::animation::Tween>,
+    /// An in-flight focus cross-fade, stepped the same way.
+    border_fade: Option<BorderFade>,
+    /// Where a mouse drag began, so the gesture can be read when it ends.
+    ///
+    /// HyprWin is not a compositor, so it cannot follow the cursor; what it can
+    /// do is remember the geometry a Windows-initiated move/resize started from
+    /// and interpret the end position. That is enough to move a tile to another
+    /// display, trade places with a neighbour, or resize the split, without ever
+    /// taking the mouse.
+    drag: Option<DragState>,
+}
+
+/// The start of a move/resize gesture, remembered until it ends.
+struct DragState {
+    id: usize,
+    start: Rect,
+    monitor: isize,
+}
+
+/// A focus cross-fade in progress: the overlay frames being faded from and to.
+///
+/// Deliberately its own clock rather than a `Tween`: a fade moves colour, not
+/// geometry, so forcing it through the rectangle interpolator would mean
+/// inventing rects to carry a fraction.
+struct BorderFade {
+    from: Vec<crate::overlay::Frame>,
+    to: Vec<crate::overlay::Frame>,
+    easing: String,
+    start: std::time::Instant,
+    duration_ms: u32,
+}
+
+impl BorderFade {
+    /// The eased progress and whether the fade has finished.
+    fn fraction(&self) -> (f32, bool) {
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        if elapsed >= self.duration_ms as u64 {
+            return (1.0, true);
+        }
+        let t = elapsed as f32 / self.duration_ms as f32;
+        (crate::animation::ease(&self.easing, t), false)
+    }
 }
 
 fn key(hwnd: HWND) -> isize {
@@ -74,13 +130,14 @@ fn key(hwnd: HWND) -> isize {
 
 impl Wm {
     pub fn new(cfg: Config) -> Self {
-        let layout_kind = cfg.default_layout;
+        let monitors = monitor::enumerate();
         let workspaces = WorkspaceState::new(cfg.workspaces);
+        let layouts = seed_layouts(&cfg, &monitors);
         Wm {
             cfg,
-            layout_kind,
+            layouts,
             workspaces,
-            monitors: monitor::enumerate(),
+            monitors,
             windows: HashMap::new(),
             by_hwnd: HashMap::new(),
             forests: HashMap::new(),
@@ -92,7 +149,113 @@ impl Wm {
             overlays: Overlays::default(),
             last_frames: Vec::new(),
             last_focus: None,
+            tween: None,
+            border_fade: None,
+            drag: None,
         }
+    }
+
+    /// Start, extend or re-aim the window-move tween with `moves`.
+    ///
+    /// `moves` are the destinations; the current rectangles are read here, so a
+    /// window already in flight continues from where it is on screen rather than
+    /// snapping back to a stale origin.
+    fn animate_into_tween(&mut self, moves: &[(HWND, Rect)]) {
+        if moves.is_empty() {
+            return;
+        }
+        let duration = self.cfg.animation_ms;
+        if duration == 0 {
+            self.tween = None;
+            let pairs: Vec<(isize, Rect)> =
+                moves.iter().map(|(h, r)| (key(*h), *r)).collect();
+            win32::set_pos_tween(&pairs);
+            return;
+        }
+        let items: Vec<(isize, Rect, Rect)> = moves
+            .iter()
+            .map(|(h, r)| (key(*h), win32::rect_of(*h).unwrap_or_default(), *r))
+            .collect();
+        let easing = self.cfg.animation_easing.clone();
+        match &mut self.tween {
+            // Keep an in-flight tween's clock so a quick succession of retiles
+            // all land together rather than restarting the easing each time.
+            Some(t) if t.easing_matches(&easing) && t.duration() != 0 => t.merge(items),
+            _ => {
+                self.tween = Some(crate::animation::Tween::new(
+                    items,
+                    duration,
+                    &easing,
+                    crate::animation::FRAME_MS,
+                ))
+            }
+        }
+    }
+
+    /// Advance whatever is animating and return how long to wait before the next
+    /// step, or `None` when nothing is left to do.
+    ///
+    /// The message loop calls this each idle pass. It applies one frame and
+    /// returns; blocking the wait here is what keeps the loop responsive between
+    /// frames without busy-spinning through them.
+    pub fn tick(&mut self) -> Option<u64> {
+        let mut wait: Option<u64> = None;
+        if let Some(t) = &self.tween {
+            let (frames, done) = t.sample();
+            win32::set_pos_tween(&frames);
+            if done {
+                self.tween = None;
+            } else {
+                wait = Some(t.sleep_ms());
+            }
+        }
+        if let Some(fade) = &self.border_fade {
+            let (t, done) = fade.fraction();
+            let blend = blend_frames(&fade.from, &fade.to, t);
+            self.overlays.redraw(&self.monitors, &blend);
+            if done {
+                self.overlays.redraw(&self.monitors, &fade.to);
+                self.last_frames = fade.to.clone();
+                self.border_fade = None;
+            } else {
+                wait = Some(wait.map_or(crate::animation::FRAME_MS as u64, |w| {
+                    w.min(crate::animation::FRAME_MS as u64)
+                }));
+            }
+        }
+        wait
+    }
+
+    /// The layout in force on `mon`, falling back to the default.
+    fn layout_of(&self, mon: isize) -> LayoutKind {
+        self.layouts
+            .get(&mon)
+            .copied()
+            .unwrap_or(self.cfg.default_layout)
+    }
+
+    /// One monitor's layout, for its line in `status.json` and `monitors`.
+    fn layout_name_of(&self, mon: isize) -> &'static str {
+        self.layout_of(mon).name()
+    }
+
+    /// The master-ratio in force on workspace `ws` of `mon`.
+    ///
+    /// A per-workspace entry wins over the global default, so a workspace can
+    /// keep its own master width; resizing the split writes one back.
+    fn master_ratio_for(&self, _mon: isize, ws: u32) -> f32 {
+        self.cfg
+            .master_ratios
+            .get(&ws.to_string())
+            .copied()
+            .unwrap_or(self.cfg.master_ratio)
+    }
+
+    /// Record a master-ratio change for workspace `ws` so a later retile keeps it.
+    fn set_master_ratio(&mut self, _mon: isize, ws: u32, ratio: f32) {
+        self.cfg
+            .master_ratios
+            .insert(ws.to_string(), ratio.clamp(0.1, 0.9));
     }
 
     // ---------------------------------------------------------------- windows
@@ -339,6 +502,214 @@ impl Wm {
         self.scratch_saves.remove(&id);
     }
 
+    /// Remember the geometry a move/resize gesture started from.
+    ///
+    /// Floating windows are left out: the user's drag is the point and nothing
+    /// snaps them back. A tiled window is recorded so the end position can be
+    /// read against where it began.
+    pub fn on_move_size_start(&mut self, hwnd: HWND) {
+        let Some(id) = self.id_of(hwnd) else {
+            return;
+        };
+        if self.workspaces.is_floating(id) {
+            return;
+        }
+        let Some(start) = win32::rect_of(hwnd) else {
+            return;
+        };
+        let monitor = self.windows.get(&id).map(|w| w.monitor).unwrap_or(0);
+        self.drag = Some(DragState {
+            id,
+            start,
+            monitor,
+        });
+    }
+
+    /// Interpret a finished move/resize gesture as a layout operation.
+    ///
+    /// Never a no-op: whatever the gesture did not decide, the retile at the end
+    /// undoes, so a drag across empty space simply leaves the window where the
+    /// layout says it belongs.
+    pub fn on_move_size_end(&mut self, hwnd: HWND) {
+        let Some(id) = self.id_of(hwnd) else {
+            return;
+        };
+        // Only a tiled, remembered window participates; anything else is just a
+        // floating window being dragged, which is allowed to stay put.
+        let Some(drag) = self.drag.take().filter(|d| d.id == id) else {
+            if !self.workspaces.is_floating(id) {
+                self.retile_window(id);
+            }
+            return;
+        };
+        if self.workspaces.is_floating(id) {
+            return;
+        }
+        let Some(end) = win32::rect_of(hwnd) else {
+            return;
+        };
+        // The window's centre before the gesture was cancelled by a mouse-down
+        // that never really moved it.
+        let center = (end.x + end.w / 2, end.y + end.h / 2);
+        let moved = (end.x - drag.start.x).abs() + (end.y - drag.start.y).abs();
+
+        // 1. A cross to another display wins: that is unambiguous, and the most
+        //    common reason to drag a tile at all.
+        if let Some(target) = self.monitor_at_point(center.0, center.1) {
+            if target != drag.monitor {
+                self.move_window_to_monitor(id, target);
+                return;
+            }
+        }
+
+        // 2. A small movement is a resize: the size changed but the window did
+        //    not travel, so trade the direction the far edge moved for a split
+        //    adjustment. A move that only jiggled in place leaves size alone and
+        //    falls through to the plain retile below.
+        let dw = end.w - drag.start.w;
+        let dh = end.h - drag.start.h;
+        if moved <= 24 {
+            if dw.abs() >= dh.abs() && dw.abs() >= 8 {
+                let dir = if dw > 0 { Direction::Right } else { Direction::Left };
+                self.resize_focused_edge(id, dir);
+                return;
+            }
+            if dh.abs() > dw.abs() && dh.abs() >= 8 {
+                let dir = if dh > 0 { Direction::Down } else { Direction::Up };
+                self.resize_focused_edge(id, dir);
+                return;
+            }
+        }
+
+        // 3. Dropped over a neighbour: trade places with it.
+        if moved >= 40 {
+            if let Some(other) = self.neighbor_at(id, center) {
+                if other != id && !self.workspaces.is_floating(other) {
+                    self.swap_windows(id, other);
+                    return;
+                }
+            }
+        }
+
+        // 4. Nothing matched: put it back.
+        self.retile_window(id);
+    }
+
+    /// The known monitor whose bounds contain `(x, y)`, if any.
+    fn monitor_at_point(&self, x: i32, y: i32) -> Option<isize> {
+        self.monitors
+            .iter()
+            .find(|m| {
+                x >= m.rect.x
+                    && x < m.rect.x + m.rect.w
+                    && y >= m.rect.y
+                    && y < m.rect.y + m.rect.h
+            })
+            .map(|m| m.handle)
+    }
+
+    /// The currently placed window other than `id` whose rectangle contains the
+    /// point, preferring the smallest (topmost, most specific) match.
+    fn neighbor_at(&self, id: usize, point: (i32, i32)) -> Option<usize> {
+        let mut best: Option<(i64, usize)> = None;
+        for (other, r) in &self.placed {
+            if *other == id {
+                continue;
+            }
+            if point.0 >= r.x
+                && point.0 < r.x + r.w
+                && point.1 >= r.y
+                && point.1 < r.y + r.h
+            {
+                let area = r.w as i64 * r.h as i64;
+                if best.map(|(a, _)| area < a).unwrap_or(true) {
+                    best = Some((area, *other));
+                }
+            }
+        }
+        best.map(|(_, o)| o)
+    }
+
+    /// Re-tile the monitor holding `id`, for a gesture that decided nothing.
+    fn retile_window(&mut self, id: usize) {
+        if let Some(mon) = self.windows.get(&id).map(|w| w.monitor) {
+            self.retile_monitor(mon);
+        }
+    }
+
+    /// Move a specific window to another monitor (the drag counterpart of
+    /// `cmd_move_to_monitor`, which acts on the focused window).
+    fn move_window_to_monitor(&mut self, id: usize, to: isize) {
+        let from = self.windows.get(&id).map(|w| w.monitor).unwrap_or(0);
+        if to == from || !self.monitors.iter().any(|m| m.handle == to) {
+            self.retile_window(id);
+            return;
+        }
+        let ws = self.workspaces.active(to);
+        self.workspaces.assign(id, ws);
+        self.forests.entry(from).or_default().forget(id);
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.monitor = to;
+            w.floating = false;
+        }
+        self.workspaces.set_floating(id, false);
+        if let Some(hwnd) = self.hwnd_of(id) {
+            win32::unmaximize(hwnd);
+        }
+        self.retile_monitor(from);
+        self.retile_monitor(to);
+        if let Some(hwnd) = self.hwnd_of(id) {
+            win32::set_foreground(hwnd);
+        }
+        self.apply_border_focus();
+    }
+
+    /// Adjust the split at `id` as though the resize keybind was pressed.
+    fn resize_focused_edge(&mut self, id: usize, dir: Direction) {
+        let delta = match dir {
+            Direction::Left | Direction::Up => -0.04,
+            Direction::Right | Direction::Down => 0.04,
+        };
+        let mon = self.windows.get(&id).map(|w| w.monitor).unwrap_or(0);
+        let ws = self.workspaces.active(mon);
+        if self.layout_of(mon) == LayoutKind::Master {
+            let next = self.master_ratio_for(mon, ws) + delta;
+            self.set_master_ratio(mon, ws, next);
+        } else {
+            let active = self.workspaces.workspace_of(id);
+            let forest = self.forests.entry(mon).or_default();
+            let mut tree = forest.deactivate(active);
+            tree.resize(id, delta);
+            forest.activate(&tree, active);
+        }
+        self.retile_monitor(mon);
+        self.apply_border_focus();
+    }
+
+    /// Exchange two windows in the layout, keeping their geometry otherwise.
+    fn swap_windows(&mut self, id: usize, other: usize) {
+        let mon = self.windows.get(&id).map(|w| w.monitor).unwrap_or(0);
+        if self.windows.get(&other).map(|w| w.monitor) != Some(mon) {
+            self.retile_window(id);
+            return;
+        }
+        let active = self.workspaces.active(mon);
+        // Both windows must be in the active workspace's tree for a swap to mean
+        // anything; the scratchpad has its own tree.
+        if self.workspaces.workspace_of(id) != active
+            || self.workspaces.workspace_of(other) != active
+        {
+            self.retile_window(id);
+            return;
+        }
+        let forest = self.forests.entry(mon).or_default();
+        let mut tree = forest.deactivate(active);
+        tree.swap(id, other);
+        forest.activate(&tree, active);
+        self.retile_monitor(mon);
+        self.apply_border_focus();
+    }
+
     /// Bring `hwnd` to the foreground. Used when the user clicks a window.
     pub fn on_external_focus(&mut self, hwnd: HWND) {
         let Some(id) = self.id_of(hwnd) else {
@@ -516,8 +887,9 @@ impl Wm {
         }
 
         let (go, gi) = (self.cfg.gaps_outer, self.cfg.gaps_inner);
-        let kind = self.layout_kind;
-        let ratio = self.cfg.master_ratio;
+        let kind = self.layout_of(mon);
+        let ratio = self.master_ratio_for(mon, active);
+        let masters = self.cfg.master_count;
 
         let mut forest = self.forests.get(&mon).cloned().unwrap_or_default();
         let tree = forest.deactivate(active);
@@ -554,7 +926,7 @@ impl Wm {
             .collect();
 
         let area = self.work_area(mon);
-        let rects = layout::compute(kind, &layout_tree, &order, area, ratio, go, gi);
+        let rects = layout::compute(kind, &layout_tree, &order, area, ratio, masters, go, gi);
 
         let mut moves: Vec<(HWND, Rect)> = Vec::new();
         let mut new_placed: Vec<(usize, Rect)> = Vec::new();
@@ -564,18 +936,27 @@ impl Wm {
                 new_placed.push((id, r));
             }
         }
+        // Stacking puts every window at the same rect in list order, and the
+        // last move wins the z-order, so raise the focused window last.
+        if kind == LayoutKind::Stacking {
+            let focused = win32::foreground();
+            if let Some(pos) = moves.iter().position(|(h, _)| *h == focused) {
+                let entry = moves.remove(pos);
+                moves.push(entry);
+            }
+        }
         for (id, r) in new_placed {
             self.placed.insert(id, r);
         }
-        win32::animate_batch(&moves, self.cfg.animation_ms, &self.cfg.animation_easing);
+        self.animate_into_tween(&moves);
 
         self.apply_visibility(mon);
         self.persist_tree(mon, active, &tree);
         // Every change to the layout funnels through a retile, so this is the one
         // place the status document needs to be republished.
         self.publish_status();
-        // The focused tile's accent may have moved with the layout, and this is
-        // reached after the animation has finished, so its new rect is in force.
+        // The focused tile's accent may have moved with the layout; the retile
+        // repaints it at its new rect rather than easing a stale one.
         self.apply_border_focus();
     }
 
@@ -590,7 +971,7 @@ impl Wm {
         let doc = self.status_document();
         if self.cfg.status_file {
             if let Err(e) = crate::status::write(&self.cfg.status_path(), &doc) {
-                eprintln!("[hyprwin] could not write status file: {e}");
+                crate::log_warn!("[hyprwin] could not write status file: {e}");
             }
         }
         if let Some(control) = crate::ipc::shared() {
@@ -692,7 +1073,16 @@ impl Wm {
         let area = self.work_area(mon);
         let rect = self.scratchpad_rect(area);
         let (go, gi) = (self.cfg.gaps_outer, self.cfg.gaps_inner);
-        let rects = layout::compute(self.layout_kind, &tree, &order, rect, self.cfg.master_ratio, go, gi);
+        let rects = layout::compute(
+            self.layout_of(mon),
+            &tree,
+            &order,
+            rect,
+            self.master_ratio_for(mon, SCRATCHPAD_WORKSPACE),
+            self.cfg.master_count,
+            go,
+            gi,
+        );
         let mut moves: Vec<(HWND, Rect)> = Vec::new();
         for (id, r) in rects {
             if let Some(hwnd) = self.hwnd_of(id) {
@@ -700,7 +1090,7 @@ impl Wm {
                 self.placed.insert(id, r);
             }
         }
-        win32::animate_batch(&moves, self.cfg.animation_ms, &self.cfg.animation_easing);
+        self.animate_into_tween(&moves);
         // The scratchpad window can hold focus while it is down; its centred
         // rect lands in `placed` here and not in `retile_monitor`.
         self.apply_border_focus();
@@ -801,50 +1191,65 @@ impl Wm {
     /// maximized when we adopted it goes back to maximized instead, the way we
     /// found it.
     pub fn reveal_all(&mut self) {
-        for w in self.windows.values() {
-            if win32::is_minimized(w.hwnd) {
-                continue;
-            }
-            win32::clear_border(w.hwnd);
-            // Un-maximize *before* restoring geometry, and never after.
-            //
-            // A window maximized while we managed it is still zoomed, and
-            // `unmaximize` restores it to the size Windows remembers — not to
-            // the geometry we saved. So placing first would only be undone by the
-            // restore that followed it, and un-maximizing first makes the
-            // placement afterwards the last word.
-            //
-            // This is unconditional, floating windows included. `SW_RESTORE` is
-            // the only thing that clears the zoomed flag, so skipping it for a
-            // window the user maximized leaves it at its old rectangle *still
-            // zoomed* — the half-restored state this whole fix exists to avoid.
-            win32::unmaximize(w.hwnd);
-            // A scratchpad window was floated and blown up; hand back the size
-            // it had, which `saved_rects` does not know about.
-            let saved = self
-                .scratch_saves
-                .get(&w.id)
-                .or_else(|| self.saved_rects.get(&w.id));
-            if let Some(r) = saved {
-                win32::set_pos(w.hwnd, *r);
-            }
-            // A window that arrived maximized has its maximized rectangle in
-            // `saved_rects`, so putting the flag back is what completes the
-            // restore: without it the window sits at the maximized size with no
-            // maximized state, which is the half-restored look from the other
-            // side. The rectangle above is ignored for a maximized window, so
-            // this has to come last — but only for windows that arrived this way,
-            // never for one maximized under our management, which must stay
-            // un-maximized.
-            if w.restore_maximized {
-                win32::maximize(w.hwnd);
-            }
-            if !win32::is_visible(w.hwnd) {
-                win32::show(w.hwnd);
-            }
-        }
+        self.release_all();
         // Never leave a floating accent behind once the tiles go back.
         self.overlays.hide_all();
+    }
+
+    /// Hand every managed window back: its saved geometry, its maximized state,
+    /// and its visibility. Shared by shutdown (`reveal_all`) and by turning
+    /// tiling off.
+    ///
+    /// Un-maximizing is *unconditional*, floating windows included. `SW_RESTORE`
+    /// is the only call that clears the zoomed flag, so skipping it for a window
+    /// the user maximized leaves it at its old rectangle *still zoomed* — the
+    /// half-restored state this whole path exists to avoid.
+    fn release_all(&self) {
+        for w in self.windows.values() {
+            self.release_window(w);
+        }
+    }
+
+    /// Release one window, or return false for a minimized one.
+    ///
+    /// Minimized windows are left alone for the same reason `apply_visibility`
+    /// skips them: touching one would yank it back onto the screen.
+    fn release_window(&self, w: &ManagedWindow) -> bool {
+        if win32::is_minimized(w.hwnd) {
+            return false;
+        }
+        win32::clear_border(w.hwnd);
+        // Un-maximize *before* restoring geometry, and never after.
+        //
+        // A window maximized while we managed it is still zoomed, and
+        // `unmaximize` restores it to the size Windows remembers — not to the
+        // geometry we saved. So placing first would only be undone by the
+        // restore that followed it, and un-maximizing first makes the placement
+        // afterwards the last word.
+        win32::unmaximize(w.hwnd);
+        // A scratchpad window was floated and blown up; hand back the size it
+        // had, which `saved_rects` does not know about.
+        let saved = self
+            .scratch_saves
+            .get(&w.id)
+            .or_else(|| self.saved_rects.get(&w.id));
+        if let Some(r) = saved {
+            win32::set_pos(w.hwnd, *r);
+        }
+        // A window that arrived maximized has its maximized rectangle in
+        // `saved_rects`, so putting the flag back is what completes the restore:
+        // without it the window sits at the maximized size with no maximized
+        // state, which is the half-restored look from the other side. The
+        // rectangle above is ignored for a maximized window, so this has to come
+        // last — but only for windows that arrived this way, never for one
+        // maximized under our management, which must stay un-maximized.
+        if w.restore_maximized {
+            win32::maximize(w.hwnd);
+        }
+        if !win32::is_visible(w.hwnd) {
+            win32::show(w.hwnd);
+        }
+        true
     }
 
     /// Raise the topmost window of the active workspace into the foreground.
@@ -918,647 +1323,6 @@ impl Wm {
         self.retile_all();
     }
 
-    // ---------------------------------------------------------------- status
-
-    /// Snapshot the state an external dashboard needs.
-    ///
-    /// The document is rebuilt from scratch every time rather than patched, so a
-    /// workspace that empties out or a window that closes cannot leave stale
-    /// counts behind for a skin to display.
-    pub fn status_document(&self) -> Status {
-        let focused = win32::foreground();
-        let focused_id = self.id_of(focused);
-        let layout = layout_name(self.layout_kind).to_string();
-        let monitors = self
-            .monitors
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let ws = self.workspaces.active(m.handle);
-                MonitorStatus {
-                    index: i + 1,
-                    primary: m.primary,
-                    active_workspace: ws,
-                    layout: layout.clone(),
-                    windows: self
-                        .windows
-                        .values()
-                        .filter(|w| {
-                            w.monitor == m.handle && self.workspaces.workspace_of(w.id) == ws
-                        })
-                        .count(),
-                    scratchpad: self.workspaces.scratchpad_visible(m.handle),
-                    scratchpad_windows: self
-                        .windows
-                        .values()
-                        .filter(|w| {
-                            w.monitor == m.handle
-                                && self.workspaces.workspace_of(w.id) == SCRATCHPAD_WORKSPACE
-                        })
-                        .count(),
-                    work_area: m.work.into(),
-                }
-            })
-            .collect();
-        Status {
-            running: true,
-            pid: std::process::id(),
-            tiling_enabled: self.tiling_enabled,
-            focused: FocusedStatus {
-                title: focused_id.map(|_| win32::title(focused)).unwrap_or_default(),
-                exe: focused_id.map(|_| win32::exe_name(focused)).unwrap_or_default(),
-                monitor: focused_id
-                    .and_then(|id| self.windows.get(&id).map(|w| w.monitor))
-                    .and_then(|mon| self.monitors.iter().position(|m| m.handle == mon))
-                    .map(|i| i + 1)
-                    .unwrap_or(0),
-            },
-            monitors,
-        }
-    }
-
-    // ---------------------------------------------------------------- borders
-
-    /// Effective overlay corner radius: `border_radius`, or the DWM preference
-    /// when it is -1.
-    ///
-    /// The DWM rounds a window with a fixed radius (about 8px at 100% DPI) that
-    /// we cannot read back, so following it is a fixed default rather than a
-    /// measurement. `rounding: 2` is the only setting that rounds.
-    fn accent_radius(&self) -> i32 {
-        if self.cfg.border_radius >= 0 {
-            self.cfg.border_radius
-        } else if self.cfg.rounding == 2 {
-            8
-        } else {
-            0
-        }
-    }
-
-    /// Build the accent frames that should be on screen right now.
-    ///
-    /// The focused tile takes `border_width` and the active colour; every other
-    /// tiled window takes `border_width_inactive` and the inactive colour, and is
-    /// omitted entirely when that width is 0 (the default), leaving its 1px DWM
-    /// line. Floating and fullscreen windows are skipped: their real geometry is
-    /// not the rect the layout holds, so an overlay frame would not match.
-    fn accent_frames(&self) -> Vec<crate::overlay::Frame> {
-        if !self.cfg.show_border {
-            return Vec::new();
-        }
-        let active = win32::foreground();
-        let a = crate::overlay::pixel(crate::config::parse_rgba(&self.cfg.border_color_active));
-        // An unset second colour means a flat accent, which is a gradient whose
-        // two ends happen to be equal.
-        let alt = self.cfg.border_color_active_alt.trim();
-        let a2 = if alt.is_empty() {
-            a
-        } else {
-            crate::overlay::pixel(crate::config::parse_rgba(alt))
-        };
-        let inactive =
-            crate::overlay::pixel(crate::config::parse_rgba(&self.cfg.border_color_inactive));
-        let radius = self.accent_radius();
-        let mut frames = Vec::new();
-        for w in self.windows.values() {
-            if w.floating || self.workspaces.is_fullscreen(w.id) {
-                continue;
-            }
-            let Some(rect) = self.placed.get(&w.id) else {
-                continue;
-            };
-            let focused = w.hwnd == active;
-            let width = if focused {
-                self.cfg.border_width
-            } else {
-                self.cfg.border_width_inactive
-            };
-            if width <= 0 {
-                continue;
-            }
-            let Some(mon) = self.monitors.iter().find(|m| m.handle == w.monitor) else {
-                continue;
-            };
-            frames.push(crate::overlay::Frame {
-                monitor: w.monitor,
-                local: Rect::new(
-                    rect.x - mon.rect.x,
-                    rect.y - mon.rect.y,
-                    rect.w,
-                    rect.h,
-                ),
-                width,
-                radius,
-                color_a: if focused { a } else { inactive },
-                color_b: if focused { a2 } else { inactive },
-            });
-        }
-        frames
-    }
-
-    pub fn apply_border_focus(&mut self) {
-        if !self.cfg.show_border {
-            self.overlays.hide_all();
-            self.last_frames.clear();
-            self.last_focus = None;
-            return;
-        }
-        let active = win32::foreground();
-        let active_color = crate::config::parse_color(&self.cfg.border_color_active);
-        let inactive_color = crate::config::parse_color(&self.cfg.border_color_inactive);
-        for w in self.windows.values() {
-            if w.floating {
-                continue;
-            }
-            let color = if w.hwnd == active {
-                active_color
-            } else {
-                inactive_color
-            };
-            win32::set_border(w.hwnd, color);
-        }
-        let frames = self.accent_frames();
-        self.overlays.redraw(&self.monitors, &frames);
-        self.last_frames = frames;
-        self.last_focus = Some(active.0 as isize);
-    }
-
-    /// Apply the accent, cross-fading the colour over `animation_ms`.
-    ///
-    /// Use this when *focus* moved, so the new tile eases into the active colour
-    /// instead of snapping. It is a no-op when the focused window has not changed,
-    /// so a retile that only moves tiles does not pay for a fade it would not
-    /// show. With `animation_ms: 0` it is exactly `apply_border_focus`.
-    pub fn apply_border_focus_animated(&mut self) {
-        let active = win32::foreground();
-        let key = Some(active.0 as isize);
-        let to = self.accent_frames();
-        let duration = self.cfg.animation_ms;
-        // Nothing to fade to, or nobody moved: draw and remember. The fade is
-        // only for a focus *change*, so an unchanged focus takes the instant path.
-        if duration == 0
-            || self.last_focus == key
-            || self.last_frames.len() != to.len()
-            || self.last_frames.is_empty()
-        {
-            self.apply_border_focus();
-            return;
-        }
-        // Pair each destination frame with the frame it is replacing. Frames are
-        // built in `windows` order, which is stable between calls, and any layout
-        // change that moved a window sends us down the instant path above.
-        let from = self.last_frames.clone();
-        let monitors = self.monitors.clone();
-        let start = Instant::now();
-        let total = (duration as f32 / 1000.0).max(0.001);
-        let frame_ms = 8u64;
-        let frames = crate::animation::frame_count(duration, frame_ms as u32);
-        for i in 0..=frames {
-            let t = if i == frames {
-                1.0
-            } else {
-                crate::animation::ease(&self.cfg.animation_easing, start.elapsed().as_secs_f32() / total)
-            };
-            let blend: Vec<crate::overlay::Frame> = from
-                .iter()
-                .zip(to.iter())
-                .map(|(f, d)| crate::overlay::Frame {
-                    color_a: crate::overlay::blend_pixel(f.color_a, d.color_a, t),
-                    color_b: crate::overlay::blend_pixel(f.color_b, d.color_b, t),
-                    ..*d
-                })
-                .collect();
-            self.overlays.redraw(&monitors, &blend);
-            if i != frames {
-                std::thread::sleep(std::time::Duration::from_millis(frame_ms));
-            }
-        }
-        self.overlays.redraw(&monitors, &to);
-        self.last_frames = to;
-        self.last_focus = key;
-    }
-
-    // ---------------------------------------------------------------- commands
-
-    pub fn command(&mut self, action: &str, arg: Option<&str>) {
-        match action {
-            "focus" => self.cmd_focus(arg, false),
-            "move" => self.cmd_focus(arg, true),
-            "resize" => self.cmd_resize(arg),
-            "togglefloating" => self.cmd_toggle_floating(),
-            "fullscreen" => self.cmd_fullscreen(),
-            "togglelayout" => self.cmd_toggle_layout(),
-            "workspace" => self.cmd_workspace(arg),
-            "movetoworkspace" => self.cmd_move_to_workspace(arg),
-            "movetomonitor" => self.cmd_move_to_monitor(arg),
-            "scratchpad" => self.cmd_scratchpad(),
-            "movetoscratchpad" => self.cmd_move_to_scratchpad(),
-            "toggletiling" => {
-                self.toggle_tiling();
-            }
-            "close" => self.cmd_close(),
-            "reload" => self.cmd_reload(),
-            other => eprintln!("[hyprwin] unknown action '{other}'"),
-        }
-    }
-
-    /// Turn tiling on or off, retiling when it comes back on.
-    ///
-    /// Lives here rather than in the tray handler so the pipe and the tray share
-    /// one implementation and one printed line.
-    pub fn toggle_tiling(&mut self) -> bool {
-        self.tiling_enabled = !self.tiling_enabled;
-        println!(
-            "[hyprwin] tiling {}",
-            if self.tiling_enabled { "enabled" } else { "disabled" }
-        );
-        if self.tiling_enabled {
-            self.retile_all();
-        } else {
-            // Disabling does not retile, so the accent would otherwise stay put
-            // over tiles that are free to move from under it.
-            self.overlays.hide_all();
-        }
-        // Disabling does not retile, so without this the published document
-        // would keep claiming tiling is on until some unrelated retile.
-        self.publish_status();
-        self.tiling_enabled
-    }
-
-    /// The `hyprctl monitors`-style summary: one line per monitor.
-    pub fn monitors_text(&self) -> String {
-        let mut out = String::new();
-        for (i, m) in self.monitors.iter().enumerate() {
-            let ws = self.workspaces.active(m.handle);
-            let count = self
-                .windows
-                .values()
-                .filter(|w| w.monitor == m.handle && self.workspaces.workspace_of(w.id) == ws)
-                .count();
-            out.push_str(&format!(
-                "monitor {} {} work area {}x{}+{}+{} workspace {} {} windows {}{}\n",
-                i + 1,
-                if m.primary { "(primary)" } else { "(secondary)" },
-                m.work.w,
-                m.work.h,
-                m.work.x,
-                m.work.y,
-                ws,
-                layout_name(self.layout_kind),
-                count,
-                if self.workspaces.scratchpad_visible(m.handle) {
-                    " scratchpad"
-                } else {
-                    ""
-                }
-            ));
-        }
-        out.trim_end().to_string()
-    }
-
-    fn focused(&self) -> Option<usize> {
-        self.id_of(win32::foreground())
-    }
-
-    /// Which monitor a command that does not carry a window should act on.
-    ///
-    /// The focused window's monitor is the answer whenever there is a focused
-    /// window. It is not, though, always there: a monitor showing an empty
-    /// workspace has nothing to focus, and keying off focus alone would then
-    /// leave it with no keyboard escape at all — every hotkey would silently
-    /// act on some other display. Falling back to the monitor under the cursor
-    /// keeps the command pointed at the display the user is looking at.
-    fn command_monitor(&self) -> Option<isize> {
-        let focused = self
-            .focused()
-            .and_then(|id| self.windows.get(&id))
-            .map(|w| w.monitor);
-        let known: Vec<isize> = self.monitors.iter().map(|m| m.handle).collect();
-        pick_monitor(focused, monitor::monitor_for_cursor(), &known)
-    }
-
-    fn cmd_focus(&mut self, arg: Option<&str>, swap: bool) {
-        let Some(focus) = self.focused() else {
-            return;
-        };
-        let dir = match arg.and_then(Direction::parse) {
-            Some(d) => d,
-            None => return,
-        };
-        let mon = self.windows[&focus].monitor;
-        if self.workspaces.is_fullscreen(focus) && !swap {
-            return;
-        }
-        // While the scratchpad is down, its window is part of what the user can
-        // see and point at, so it joins the neighbour search. A swap across the
-        // two trees would be meaningless (they are laid out independently), so
-        // it only happens within one workspace.
-        let rects: Vec<(usize, Rect)> = {
-            let ws = self.workspaces.active(mon);
-            let scratch = self.workspaces.scratchpad_visible(mon);
-            self.placed
-                .iter()
-                .filter(|(id, _)| {
-                    let on = self.workspaces.workspace_of(**id);
-                    on == ws || (scratch && on == SCRATCHPAD_WORKSPACE)
-                })
-                .map(|(id, r)| (*id, *r))
-                .collect()
-        };
-        let Some(target) = layout::neighbor(&rects, focus, dir) else {
-            return;
-        };
-        let same_workspace = self.workspaces.workspace_of(focus) == self.workspaces.workspace_of(target);
-        if swap && same_workspace && !self.workspaces.is_floating(target) {
-            let active = self.workspaces.workspace_of(focus);
-            let forest = self.forests.entry(mon).or_default();
-            let mut tree = forest.deactivate(active);
-            tree.swap(focus, target);
-            forest.activate(&tree, active);
-            self.retile_monitor(mon);
-        } else {
-            if let Some(hwnd) = self.hwnd_of(target) {
-                win32::set_foreground(hwnd);
-            }
-            // Focus moved between tiles with the layout untouched, so the accent
-            // eases onto the new tile rather than snapping.
-            self.apply_border_focus_animated();
-        }
-    }
-
-    fn cmd_resize(&mut self, arg: Option<&str>) {
-        let Some(focus) = self.focused() else {
-            return;
-        };
-        let Some(dir) = arg.and_then(Direction::parse) else {
-            return;
-        };
-        let mon = self.windows[&focus].monitor;
-        let delta = match dir {
-            Direction::Left | Direction::Up => -0.04,
-            Direction::Right | Direction::Down => 0.04,
-        };
-        // Resize the split in whichever tree the window actually lives in: the
-        // active workspace's, or the scratchpad's while it is down.
-        let active = self.workspaces.workspace_of(focus);
-        let forest = self.forests.entry(mon).or_default();
-        let mut tree = forest.deactivate(active);
-        tree.resize(focus, delta);
-        forest.activate(&tree, active);
-        self.retile_monitor(mon);
-    }
-
-    fn cmd_toggle_floating(&mut self) {
-        let Some(focus) = self.focused() else {
-            return;
-        };
-        let mon = self.windows[&focus].monitor;
-        let floating = self.workspaces.toggle_floating(focus);
-        if let Some(w) = self.windows.get_mut(&focus) {
-            w.floating = floating;
-        }
-        if floating {
-            if let Some(hwnd) = self.hwnd_of(focus) {
-                // Keep the current size but centre the window on the work area.
-                let area = self.work_area(mon);
-                let cur = win32::rect_of(hwnd).unwrap_or(Rect::new(0, 0, 800, 600));
-                let w = cur.w.clamp(320, area.w);
-                let h = cur.h.clamp(240, area.h);
-                let rect = Rect::new(
-                    area.x + (area.w - w) / 2,
-                    area.y + (area.h - h) / 2,
-                    w,
-                    h,
-                );
-                win32::clear_border(hwnd);
-                win32::animate_batch(&[(hwnd, rect)], self.cfg.animation_ms, &self.cfg.animation_easing);
-            }
-        } else {
-            if let Some(hwnd) = self.hwnd_of(focus) {
-                if self.cfg.rounding > 0 {
-                    win32::set_rounding(hwnd, self.cfg.rounding);
-                }
-            }
-        }
-        self.retile_monitor(mon);
-    }
-
-    fn cmd_fullscreen(&mut self) {
-        let Some(focus) = self.focused() else {
-            return;
-        };
-        let mon = self.windows[&focus].monitor;
-        let on = self.workspaces.toggle_fullscreen(focus);
-        let Some(hwnd) = self.hwnd_of(focus) else {
-            return;
-        };
-        if on {
-            let rect = self.monitor_rect(mon);
-            win32::animate_batch(&[(hwnd, rect)], self.cfg.animation_ms, &self.cfg.animation_easing);
-            win32::set_foreground(hwnd);
-            // The window now fills the monitor, so its tile accent no longer
-            // matches where it is; the filter in `apply_border_focus` clears it.
-            self.apply_border_focus();
-        } else {
-            self.retile_monitor(mon);
-        }
-    }
-
-    fn cmd_toggle_layout(&mut self) {
-        self.layout_kind = match self.layout_kind {
-            LayoutKind::Dwindle => LayoutKind::Master,
-            LayoutKind::Master => LayoutKind::Dwindle,
-        };
-        self.retile_all();
-    }
-
-    fn cmd_workspace(&mut self, arg: Option<&str>) {
-        let Some(arg) = arg else { return };
-        let Some(mon) = self.command_monitor() else {
-            return;
-        };
-        let target = match arg {
-            "next" => self.workspaces.workspace_after(mon, 1),
-            "prev" => self.workspaces.workspace_after(mon, -1),
-            n => match n.parse::<u32>() {
-                Ok(ws) => ws,
-                Err(_) => return,
-            },
-        };
-        self.switch_workspace(mon, target);
-    }
-
-    fn cmd_move_to_workspace(&mut self, arg: Option<&str>) {
-        let Some(arg) = arg else { return };
-        let Ok(ws) = arg.parse::<u32>() else { return };
-        let Some(focus) = self.focused() else {
-            return;
-        };
-        let mon = self.windows[&focus].monitor;
-        self.workspaces.assign(focus, ws);
-        // Follow the window, like Hyprland's movetoworkspace.
-        self.switch_workspace(mon, ws);
-    }
-
-    /// Move the focused window to another monitor.
-    ///
-    /// Workspace numbers are per-monitor and the target's active workspace has no
-    /// reason to match the source's, so the window is reassigned to whatever the
-    /// target is showing. That is the only assignment that keeps it visible: any
-    /// other number would hide it the moment it arrives.
-    fn cmd_move_to_monitor(&mut self, arg: Option<&str>) {
-        let Some(focus) = self.focused() else {
-            return;
-        };
-        let from = self.windows[&focus].monitor;
-        let Some(to) = self.monitor_step(from, arg.unwrap_or("next")) else {
-            return;
-        };
-        if to == from {
-            return;
-        }
-        let ws = self.workspaces.active(to);
-        self.workspaces.assign(focus, ws);
-        self.forests.entry(from).or_default().forget(focus);
-        if let Some(w) = self.windows.get_mut(&focus) {
-            w.monitor = to;
-            w.floating = false;
-        }
-        self.workspaces.set_floating(focus, false);
-        if let Some(hwnd) = self.hwnd_of(focus) {
-            win32::unmaximize(hwnd);
-        }
-        self.retile_monitor(from);
-        self.retile_monitor(to);
-        if let Some(hwnd) = self.hwnd_of(focus) {
-            win32::set_foreground(hwnd);
-        }
-        self.apply_border_focus();
-    }
-
-    /// The scratchpad toggle: drop its window over everything, or pull it away.
-    ///
-    /// Deliberately explicit: it never picks a window for you. `movetoscratchpad`
-    /// is the way to put something on the scratchpad, so this chord always means
-    /// the same thing whatever is focused. With nothing on the scratchpad it sets
-    /// the flag and shows nothing, which is exactly what Hyprland does.
-    fn cmd_scratchpad(&mut self) {
-        let Some(mon) = self.command_monitor() else {
-            return;
-        };
-        let down = self.workspaces.toggle_scratchpad(mon);
-        if down {
-            self.focus_scratchpad(mon);
-        } else {
-            self.unfocus_scratchpad(mon);
-        }
-        self.retile_monitor(mon);
-        self.apply_border_focus();
-    }
-
-    /// Move the focused window onto the scratchpad and drop it down.
-    fn cmd_move_to_scratchpad(&mut self) {
-        let Some(focus) = self.focused() else {
-            return;
-        };
-        let mon = self.windows[&focus].monitor;
-        self.make_scratchpad(focus);
-        if !self.workspaces.scratchpad_visible(mon) {
-            self.workspaces.toggle_scratchpad(mon);
-        }
-        // Make sure the window's shape is remembered before the retile blows it
-        // up, so pulling the scratchpad up can hand it back.
-        if let Some(hwnd) = self.hwnd_of(focus) {
-            if let Some(r) = win32::rect_of(hwnd) {
-                self.remember_scratch_shape(focus, r);
-            }
-        }
-        self.retile_monitor(mon);
-        self.apply_border_focus();
-    }
-
-    /// Retag a window as the scratchpad's and put it in the scratchpad's tree.
-    ///
-    /// This does the tree placement rather than leaving it to `ensure_tree`,
-    /// because the retile reconciles the active workspace's tree and never looks
-    /// at a parked one: a window whose *assignment* changed but which is sitting
-    /// in the active workspace's tree would otherwise be pruned out of that tree
-    /// and never inserted anywhere.
-    fn make_scratchpad(&mut self, id: usize) {
-        let mon = self.windows[&id].monitor;
-        self.workspaces.assign_raw(id, SCRATCHPAD_WORKSPACE);
-        if let Some(w) = self.windows.get_mut(&id) {
-            w.floating = false;
-        }
-        self.workspaces.set_floating(id, false);
-        // Drop it from the active workspace's tree, then place it in the
-        // scratchpad's own tree. `forget` covers every parked tree too.
-        self.forests.entry(mon).or_default().forget(id);
-        let forest = self.forests.entry(mon).or_default();
-        let mut tree = forest.deactivate(SCRATCHPAD_WORKSPACE);
-        tree.insert(id, None);
-        forest.activate(&tree, SCRATCHPAD_WORKSPACE);
-    }
-
-    /// A monitor by relative position or index: "next", "prev", or "1".."N".
-    fn monitor_step(&self, from: isize, arg: &str) -> Option<isize> {
-        parse_monitor(arg, &self.monitors).or_else(|| {
-            let handles: Vec<isize> = self.monitors.iter().map(|m| m.handle).collect();
-            let i = handles.iter().position(|h| *h == from)?;
-            let n = handles.len();
-            let next = match arg {
-                "next" => (i + 1) % n.max(1),
-                "prev" => (i + n - 1) % n.max(1),
-                _ => return None,
-            };
-            handles.get(next).copied()
-        })
-    }
-
-    fn cmd_close(&mut self) {
-        if let Some(focus) = self.focused() {
-            if let Some(hwnd) = self.hwnd_of(focus) {
-                win32::post_close(hwnd);
-            }
-        }
-    }
-
-    fn cmd_reload(&mut self) {
-        match Config::load_or_create() {
-            Ok(cfg) => {
-                self.layout_kind = cfg.default_layout;
-                self.cfg = cfg;
-                println!("[hyprwin] config reloaded");
-            }
-            Err(e) => eprintln!("[hyprwin] reload failed: {e:#}"),
-        }
-    }
-
-    /// Windows that were open but are now gone. Called on every hook event as a
-    /// safety net for closings we never received an event for.
-    pub fn prune_dead(&mut self) {
-        let dead: Vec<(usize, isize)> = self
-            .windows
-            .values()
-            .filter(|w| !win32::is_window(w.hwnd))
-            .map(|w| (w.id, w.monitor))
-            .collect();
-        if dead.is_empty() {
-            return;
-        }
-        let mut mons: Vec<isize> = Vec::new();
-        for (id, mon) in dead {
-            self.drop_window(id);
-            self.forests.entry(mon).or_default().forget(id);
-            mons.push(mon);
-        }
-        mons.sort_unstable();
-        mons.dedup();
-        for mon in mons {
-            self.retile_monitor(mon);
-        }
-        self.apply_border_focus();
-    }
 }
 
 /// Choose the monitor a windowless command should act on.
@@ -1617,10 +1381,46 @@ fn parse_monitor(arg: &str, monitors: &[Monitor]) -> Option<isize> {
 }
 
 fn layout_name(kind: LayoutKind) -> &'static str {
-    match kind {
-        LayoutKind::Dwindle => "dwindle",
-        LayoutKind::Master => "master",
+    kind.name()
+}
+
+/// Blend each destination overlay frame towards its source frame by `t`.
+///
+/// Both lists are built in `windows` order, which is stable between calls, so
+/// index `i` is the same window in each. A caller must only cross-fade lists of
+/// equal length; a change in length means the layout itself moved and the fade
+/// is not meaningful.
+fn blend_frames(
+    from: &[crate::overlay::Frame],
+    to: &[crate::overlay::Frame],
+    t: f32,
+) -> Vec<crate::overlay::Frame> {
+    to.iter()
+        .zip(from.iter())
+        .map(|(d, f)| crate::overlay::Frame {
+            color_a: crate::overlay::blend_pixel(f.color_a, d.color_a, t),
+            color_b: crate::overlay::blend_pixel(f.color_b, d.color_b, t),
+            ..*d
+        })
+        .collect()
+}
+
+/// Each monitor's starting layout: `layouts["N"]` if present, else the default.
+///
+/// Monitor "N" is the `monitors` index, 1-based and primary first, so the key
+/// matches the number a `monitor` rule and `status.json` already use.
+fn seed_layouts(cfg: &Config, monitors: &[Monitor]) -> HashMap<isize, LayoutKind> {
+    let mut out = HashMap::new();
+    for (i, m) in monitors.iter().enumerate() {
+        let key = (i + 1).to_string();
+        let kind = cfg
+            .layouts
+            .get(&key)
+            .copied()
+            .unwrap_or(cfg.default_layout);
+        out.insert(m.handle, kind);
     }
+    out
 }
 
 /// Convenience for `Direction` parsing used by tests.
@@ -1706,5 +1506,65 @@ mod tests {
     #[test]
     fn a_focused_window_outranks_the_cursor() {
         assert_eq!(pick_monitor(Some(20), Some(10), &[10, 20]), Some(20));
+    }
+
+    #[test]
+    fn a_master_ratio_override_is_remembered_per_workspace() {
+        let mut wm = Wm::new(Config::default());
+        let mon = 0;
+        // Workspace 1 has no override, so the global default applies.
+        assert_eq!(wm.master_ratio_for(mon, 1), wm.cfg.master_ratio);
+        // Setting one applies to that workspace alone.
+        wm.set_master_ratio(mon, 1, 0.75);
+        assert_eq!(wm.master_ratio_for(mon, 1), 0.75);
+        assert_eq!(wm.master_ratio_for(mon, 2), wm.cfg.master_ratio);
+        // The clamp keeps a stray drag from collapsing the master column.
+        wm.set_master_ratio(mon, 1, 0.01);
+        assert_eq!(wm.master_ratio_for(mon, 1), 0.1);
+        wm.set_master_ratio(mon, 1, 5.0);
+        assert_eq!(wm.master_ratio_for(mon, 1), 0.9);
+    }
+
+    #[test]
+    fn the_monitor_under_a_point_is_the_one_whose_bounds_contain_it() {
+        use crate::monitor::Monitor;
+        let mut wm = Wm::new(Config::default());
+        wm.monitors = vec![
+            Monitor {
+                handle: 10,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work: Rect::new(0, 0, 1920, 1040),
+                primary: true,
+            },
+            Monitor {
+                handle: 20,
+                rect: Rect::new(-1920, 0, 1920, 1080),
+                work: Rect::new(-1920, 0, 1920, 1040),
+                primary: false,
+            },
+        ];
+        assert_eq!(wm.monitor_at_point(100, 100), Some(10));
+        // The right edge is exclusive, matching how the rectangles tile.
+        assert_eq!(wm.monitor_at_point(1919, 100), Some(10));
+        assert_eq!(wm.monitor_at_point(-1, 100), Some(20));
+        // A point in no monitor's bounds (a gap between differently-shaped
+        // displays) yields nothing rather than a wrong guess.
+        assert_eq!(wm.monitor_at_point(5000, 5000), None);
+    }
+
+    #[test]
+    fn the_smallest_placed_rect_under_a_point_wins_a_swap_target() {
+        let mut wm = Wm::new(Config::default());
+        // Window 2 fills the left half, window 3 a small pane on top of it.
+        wm.placed.insert(2, Rect::new(0, 0, 960, 1080));
+        wm.placed.insert(3, Rect::new(20, 20, 200, 200));
+        // A point inside both picks the smaller/topmost window.
+        assert_eq!(wm.neighbor_at(1, (100, 100)), Some(3));
+        // A point inside only the big one picks that.
+        assert_eq!(wm.neighbor_at(1, (800, 800)), Some(2));
+        // A point inside neither has no target.
+        assert_eq!(wm.neighbor_at(1, (2000, 2000)), None);
+        // The dragged window is never its own target.
+        assert_eq!(wm.neighbor_at(3, (100, 100)), Some(2));
     }
 }
