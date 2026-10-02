@@ -9,8 +9,10 @@ mod config;
 mod events;
 mod hook;
 mod hotkey;
+mod ipc;
 mod layout;
 mod monitor;
+mod protocol;
 mod status;
 mod tray;
 mod win32;
@@ -20,6 +22,7 @@ mod workspace;
 use anyhow::{Context, Result};
 use config::Config;
 use events::{AppEvent, TrayCommand, WinEvent};
+use protocol::Response;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use windows::Win32::Foundation::{BOOL, TRUE};
@@ -100,6 +103,13 @@ fn run() -> Result<()> {
     }
 
     let mut wm = Wm::new(cfg);
+
+    // Control pipe: lets `hyprwinctl` and scripts drive a running instance. It
+    // only ever queues events, so tiling state stays on this thread. Started
+    // before adoption so the first retile populates its snapshot.
+    ipc::spawn();
+    println!("[hyprwin] control pipe {}", ipc::full_pipe_path());
+
     let adopted = if wm.cfg.manage_on_start {
         wm.manage_existing()
     } else {
@@ -203,16 +213,32 @@ fn handle_app_event(wm: &mut Wm, ev: AppEvent, _regs: &[hotkey::Registered], qui
         AppEvent::Tray(TrayCommand::Quit) => *quit = true,
         AppEvent::Tray(TrayCommand::Reload) => wm.command("reload", None),
         AppEvent::Tray(TrayCommand::ToggleTiling) => {
-            wm.tiling_enabled = !wm.tiling_enabled;
-            println!(
-                "[hyprwin] tiling {}",
-                if wm.tiling_enabled { "enabled" } else { "disabled" }
-            );
-            if wm.tiling_enabled {
-                wm.retile_all();
-            }
+            wm.toggle_tiling();
         }
+        AppEvent::Control(c) => handle_control(wm, c, quit),
     }
+}
+
+/// Run a control-pipe request and send its answer back to the pipe thread.
+///
+/// An unknown action is reported as an error instead of the silent log line the
+/// hotkey path uses, because here there is a caller waiting to be told.
+fn handle_control(wm: &mut Wm, c: events::ControlCommand, quit: &mut bool) {
+    let reply = if c.action.eq_ignore_ascii_case("quit") {
+        *quit = true;
+        Response::Ok("shutting down".to_string())
+    } else if protocol::ACTIONS.contains(&c.action.as_str()) {
+        wm.command(&c.action, c.arg.as_deref());
+        let echo = match c.arg.as_deref() {
+            Some(arg) => format!("{} {arg}", c.action),
+            None => c.action.clone(),
+        };
+        Response::Ok(echo)
+    } else {
+        Response::Err(format!("unknown action '{}'", c.action))
+    };
+    // The client may have hung up; that is not an error for us.
+    let _ = c.reply.send(reply);
 }
 
 fn handle_win_event(wm: &mut Wm, ev: WinEvent) {

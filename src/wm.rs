@@ -546,12 +546,23 @@ impl Wm {
 
     /// Write the status document if the user asked for one. Failures are logged
     /// once per write; a dashboard is a convenience, not a reason to stop tiling.
+    ///
+    /// This also refreshes the control pipe's snapshot, so `hyprwinctl status`
+    /// answers from the same facts the file holds without waking the main loop.
+    /// The snapshot is refreshed whether or not the file is written, because the
+    /// control interface does not depend on `status_file`.
     pub fn publish_status(&self) {
-        if !self.cfg.status_file {
-            return;
+        let doc = self.status_document();
+        if self.cfg.status_file {
+            if let Err(e) = crate::status::write(&self.cfg.status_path(), &doc) {
+                eprintln!("[hyprwin] could not write status file: {e}");
+            }
         }
-        if let Err(e) = crate::status::write(&self.cfg.status_path(), &self.status_document()) {
-            eprintln!("[hyprwin] could not write status file: {e}");
+        if let Some(control) = crate::ipc::shared() {
+            if let Ok(mut c) = control.lock() {
+                c.status = doc.to_json();
+                c.monitors = self.monitors_text();
+            }
         }
     }
 
@@ -933,10 +944,63 @@ impl Wm {
             "movetomonitor" => self.cmd_move_to_monitor(arg),
             "scratchpad" => self.cmd_scratchpad(),
             "movetoscratchpad" => self.cmd_move_to_scratchpad(),
+            "toggletiling" => {
+                self.toggle_tiling();
+            }
             "close" => self.cmd_close(),
             "reload" => self.cmd_reload(),
             other => eprintln!("[hyprwin] unknown action '{other}'"),
         }
+    }
+
+    /// Turn tiling on or off, retiling when it comes back on.
+    ///
+    /// Lives here rather than in the tray handler so the pipe and the tray share
+    /// one implementation and one printed line.
+    pub fn toggle_tiling(&mut self) -> bool {
+        self.tiling_enabled = !self.tiling_enabled;
+        println!(
+            "[hyprwin] tiling {}",
+            if self.tiling_enabled { "enabled" } else { "disabled" }
+        );
+        if self.tiling_enabled {
+            self.retile_all();
+        }
+        // Disabling does not retile, so without this the published document
+        // would keep claiming tiling is on until some unrelated retile.
+        self.publish_status();
+        self.tiling_enabled
+    }
+
+    /// The `hyprctl monitors`-style summary: one line per monitor.
+    pub fn monitors_text(&self) -> String {
+        let mut out = String::new();
+        for (i, m) in self.monitors.iter().enumerate() {
+            let ws = self.workspaces.active(m.handle);
+            let count = self
+                .windows
+                .values()
+                .filter(|w| w.monitor == m.handle && self.workspaces.workspace_of(w.id) == ws)
+                .count();
+            out.push_str(&format!(
+                "monitor {} {} work area {}x{}+{}+{} workspace {} {} windows {}{}\n",
+                i + 1,
+                if m.primary { "(primary)" } else { "(secondary)" },
+                m.work.w,
+                m.work.h,
+                m.work.x,
+                m.work.y,
+                ws,
+                layout_name(self.layout_kind),
+                count,
+                if self.workspaces.scratchpad_visible(m.handle) {
+                    " scratchpad"
+                } else {
+                    ""
+                }
+            ));
+        }
+        out.trim_end().to_string()
     }
 
     fn focused(&self) -> Option<usize> {

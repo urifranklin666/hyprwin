@@ -5,7 +5,7 @@
 //! channel.
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 /// Something happened to a top-level window.
 ///
@@ -30,26 +30,45 @@ pub enum TrayCommand {
     Quit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A command from the control pipe, with the channel its answer goes back on.
+///
+/// The pipe thread owns the connection, but only the main thread may touch the
+/// tiling state, so the request travels here and the reply travels back through
+/// `reply`. The sender is dropped if the client gave up, which the pipe thread
+/// treats as "nobody is listening" rather than an error.
+pub struct ControlCommand {
+    pub action: String,
+    pub arg: Option<String>,
+    pub reply: Sender<crate::protocol::Response>,
+}
+
 pub enum AppEvent {
     Win(WinEvent),
     Tray(TrayCommand),
+    Control(ControlCommand),
 }
 
-static TX: OnceLock<Sender<AppEvent>> = OnceLock::new();
+static TX: Mutex<Option<Sender<AppEvent>>> = Mutex::new(None);
 
 /// Create the channel. Call once, before installing any hooks.
+///
+/// Installs a fresh sender, replacing any earlier one. Production calls this
+/// exactly once; tests call it per case so each gets its own receiver.
 pub fn init() -> Receiver<AppEvent> {
     let (tx, rx) = mpsc::channel();
-    let _ = TX.set(tx);
+    if let Ok(mut slot) = TX.lock() {
+        *slot = Some(tx);
+    }
     rx
 }
 
 /// Send from hook callbacks and window procs. Silently drops if nobody listens,
 /// which is what happens during shutdown.
 pub fn send(ev: AppEvent) {
-    if let Some(tx) = TX.get() {
-        let _ = tx.send(ev);
+    if let Ok(slot) = TX.lock() {
+        if let Some(tx) = slot.as_ref() {
+            let _ = tx.send(ev);
+        }
     }
 }
 
@@ -57,17 +76,52 @@ pub fn send(ev: AppEvent) {
 mod tests {
     use super::*;
 
+    /// `init` installs a process-wide sender, so these tests must not interleave
+    /// or one case would receive another's events.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn events_are_delivered_in_order() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let rx = init();
         send(AppEvent::Win(WinEvent::Created(0x1234)));
         send(AppEvent::Tray(TrayCommand::Quit));
-        assert_eq!(rx.recv().unwrap(), AppEvent::Win(WinEvent::Created(0x1234)));
-        assert_eq!(rx.recv().unwrap(), AppEvent::Tray(TrayCommand::Quit));
+        let first = rx.recv().unwrap();
+        assert!(matches!(first, AppEvent::Win(WinEvent::Created(0x1234))));
+        let second = rx.recv().unwrap();
+        assert!(matches!(second, AppEvent::Tray(TrayCommand::Quit)));
     }
 
     #[test]
     fn sending_without_a_receiver_does_not_panic() {
+        // No `init`: the sender slot is whatever another test left, and `send`
+        // must tolerate both an absent and a dropped receiver.
         send(AppEvent::Tray(TrayCommand::Reload));
+    }
+
+    #[test]
+    fn a_control_command_carries_its_reply_channel() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = init();
+        let (tx, answer) = mpsc::channel();
+        send(AppEvent::Control(ControlCommand {
+            action: "workspace".to_string(),
+            arg: Some("3".to_string()),
+            reply: tx,
+        }));
+        match rx.recv().unwrap() {
+            AppEvent::Control(c) => {
+                assert_eq!(c.action, "workspace");
+                assert_eq!(c.arg.as_deref(), Some("3"));
+                c.reply
+                    .send(crate::protocol::Response::Ok("switched".to_string()))
+                    .unwrap();
+            }
+            _ => panic!("expected a control event"),
+        }
+        assert_eq!(
+            answer.recv().unwrap(),
+            crate::protocol::Response::Ok("switched".to_string())
+        );
     }
 }

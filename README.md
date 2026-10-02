@@ -13,7 +13,7 @@ komorebi and GlazeWM, and it is the only model Windows permits.
 
 ## Status
 
-Working, verified by the unit suite (`82 passed`), a clean release build and a
+Working, verified by the unit suite (`96 passed`), a clean release build and a
 live run against a two-monitor desktop. See
 [Manual smoke test](#manual-smoke-test) for the checklist to run yourself.
 
@@ -35,6 +35,7 @@ live run against a two-monitor desktop. See
 | Keybinds | Configurable, with a `main` placeholder for the primary modifier |
 | Window rules | Match exe / class / title, then float (optionally by size), ignore, pin to a workspace, or send to a monitor or the scratchpad |
 | Status output | Writes `status.json` (active workspace, layout, focus, window counts, work areas) for a Rainmeter skin or any other dashboard to read |
+| Control interface | `hyprwinctl` drives a running instance over a named pipe: switch workspace, toggle tiling, reload, query status |
 | Animations | Eased interpolation of moves and resizes (best effort) |
 | Tray icon | Reload config / toggle tiling / quit |
 | Autostart | Optional `HKCU\...\Run` registration |
@@ -67,6 +68,9 @@ cargo test
 ```
 
 The binary lands at `target/release/hyprwin.exe`.
+
+A second binary, `target/release/hyprwinctl.exe`, is built alongside it to drive
+a running instance. Both are built by the same `cargo build`.
 
 If `cargo` is not on your `PATH` after a fresh rustup install, use
 `%USERPROFILE%\.cargo\bin\cargo.exe`.
@@ -262,6 +266,39 @@ has no bar of its own.
 
 ---
 
+## Control interface
+
+`status.json` lets other programs **read** HyprWin. `hyprwinctl.exe` lets them
+**act**. It is the `hyprctl` analogue: it talks to a running instance over a
+named pipe and exits with a status a script can check.
+
+```sh
+hyprwinctl status              # the status document, as status.json holds it
+hyprwinctl monitors            # one line per monitor
+hyprwinctl workspace 3         # switch the focused monitor to workspace 3
+hyprwinctl togglelayout
+hyprwinctl reload
+hyprwinctl quit                # ask HyprWin to exit cleanly
+```
+
+Anything else is passed to the same dispatcher the keybinds use, so the
+vocabulary is exactly the keybind action list — `focus left`, `movetomonitor
+next`, `movetoscratchpad`, `toggletiling`, and so on — plus `status`,
+`monitors` and `quit`. A successful command echoes what it ran; an unknown one
+prints `unknown action '...'` and exits `1`.
+
+The pipe is `\\.\pipe\hyprwin` (one instance per user session) and speaks a
+single line per request. A reply is tagged `OK`, `DATA` or `ERR`, followed by
+the payload; `status` and `monitors` are answered from the same snapshot that
+was last written to `status.json`, and everything that changes tiling state is
+queued onto the main thread, so the pipe can never touch the layout directly.
+Any JSON client can talk to it without `hyprwinctl`, which is what makes it
+usable from a Rainmeter action or a startup script.
+
+Requests are answered in order and a client that hangs up is simply dropped.
+
+---
+
 ## Architecture
 
 | Module | Responsibility |
@@ -279,7 +316,9 @@ has no bar of its own.
 | `tray.rs` | Tray icon and menu |
 | `autostart.rs` | `HKCU\...\Run` helper |
 | `status.rs` | The `status.json` document and its atomic write |
-| `events.rs` | The channel shared by hooks, tray and the main loop |
+| `protocol.rs` | The control-line format, shared by both binaries |
+| `ipc.rs` | The control pipe: a listener thread that queues requests onto the main loop |
+| `events.rs` | The channel shared by hooks, tray, pipe and the main loop |
 
 Three design points worth knowing:
 
@@ -338,6 +377,11 @@ Run `target\release\hyprwin.exe`, then check:
 21. Read `%APPDATA%\hyprwin\status.json` after each of the above — the active
     workspace, layout, focus and window counts track what you see, and `running`
     becomes `false` after you quit.
+22. With HyprWin running, use `hyprwinctl` from another terminal: `hyprwinctl
+    monitors` lists both displays, `hyprwinctl workspace 2` switches the focused
+    monitor, `hyprwinctl bogus` reports `unknown action` and exits non-zero, and
+    `hyprwinctl quit` shuts HyprWin down exactly like the tray's Quit. With
+    HyprWin stopped, `hyprwinctl monitors` says nothing is listening.
 
 ## License
 
