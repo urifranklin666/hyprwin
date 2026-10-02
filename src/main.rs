@@ -12,6 +12,7 @@ mod hotkey;
 mod ipc;
 mod layout;
 mod monitor;
+mod overlay;
 mod protocol;
 mod status;
 mod tray;

@@ -84,6 +84,9 @@ pub struct Config {
     pub border_color_active: String,
     /// Inactive window border colour, "#RRGGBB".
     pub border_color_inactive: String,
+    /// Focused-window accent thickness in pixels, drawn by a per-monitor
+    /// overlay window. 0 disables the accent; the 1px DWM line stays either way.
+    pub border_width: i32,
     /// DWM corner preference: 0 = default, 1 = do not round, 2 = round.
     pub rounding: i32,
     /// Animation duration in milliseconds. 0 disables animation.
@@ -117,6 +120,7 @@ impl Default for Config {
             show_border: true,
             border_color_active: "#7aa2f7".to_string(),
             border_color_inactive: "#3b4261".to_string(),
+            border_width: 3,
             rounding: 2,
             animation_ms: 120,
             animation_easing: "cubic".to_string(),
@@ -275,6 +279,10 @@ impl Config {
         anyhow::ensure!(self.gaps_outer >= 0, "gaps_outer must be >= 0");
         anyhow::ensure!(self.gaps_inner >= 0, "gaps_inner must be >= 0");
         anyhow::ensure!(
+            (0..=64).contains(&self.border_width),
+            "border_width must be between 0 and 64"
+        );
+        anyhow::ensure!(
             self.master_ratio > 0.1 && self.master_ratio < 0.9,
             "master_ratio must be between 0.1 and 0.9"
         );
@@ -340,6 +348,26 @@ pub fn parse_color(s: &str) -> u32 {
     (b << 16) | (g << 8) | r
 }
 
+/// Parse "#RRGGBB" / "#AARRGGBB" into `(r, g, b, a)` for drawing on a 32-bit
+/// DIBSection, whose pixels are BGRA little-endian.
+///
+/// Only the overlay uses this: DWM border colours are COLORREFs. An absent
+/// alpha byte means fully opaque, which is what a six-digit hex colour means.
+pub fn parse_rgba(s: &str) -> (u8, u8, u8, u8) {
+    let t = s.trim().trim_start_matches('#').trim_start_matches("0x");
+    let v = u32::from_str_radix(t, 16).unwrap_or(0);
+    if t.len() >= 8 {
+        (
+            (v >> 16) as u8,
+            (v >> 8) as u8,
+            v as u8,
+            (v >> 24) as u8,
+        )
+    } else {
+        ((v >> 16) as u8, (v >> 8) as u8, v as u8, 0xFF)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +378,13 @@ mod tests {
         assert_eq!(parse_color("0000FF"), 0xFF0000);
         // Alpha is ignored: DWM border colours do not support transparency.
         assert_eq!(parse_color("#80FF0000"), 0x0000FF);
+    }
+
+    #[test]
+    fn rgba_parsing_keeps_order_and_defaults_to_opaque() {
+        assert_eq!(parse_rgba("#7AA2F7"), (0x7A, 0xA2, 0xF7, 0xFF));
+        assert_eq!(parse_rgba("#807AA2F7"), (0x7A, 0xA2, 0xF7, 0x80));
+        assert_eq!(parse_rgba("garbage"), (0, 0, 0, 0xFF));
     }
 
     #[test]

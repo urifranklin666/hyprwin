@@ -13,7 +13,7 @@ komorebi and GlazeWM, and it is the only model Windows permits.
 
 ## Status
 
-Working, verified by the unit suite (`98 passed`), a clean release build and a
+Working, verified by the unit suite (`99 passed`), a clean release build and a
 live run against a two-monitor desktop. See
 [Manual smoke test](#manual-smoke-test) for the checklist to run yourself.
 
@@ -29,6 +29,7 @@ live run against a two-monitor desktop. See
 | Clean exit | Quitting un-hides windows parked on other workspaces and restores their original geometry |
 | Gaps | Configurable outer (edge) and inner (between windows) |
 | Borders + rounding | DWM accent border, active/inactive colours, Win11 corner rounding |
+| Thick focused accent | A per-monitor overlay draws a `border_width`-pixel frame around the focused tile, on top of the 1px DWM line |
 | Virtual workspaces | Per-monitor, numbered; off-workspace windows are hidden and shown again on return, with one raised into focus |
 | Scratchpad | A drop-down window over whatever workspace you are on, hideable with one key and reachable from any workspace |
 | Move between monitors | `movetomonitor` sends the focused window to the other display |
@@ -157,6 +158,7 @@ the documented default.
   "show_border": true,
   "border_color_active": "#7aa2f7",
   "border_color_inactive": "#3b4261",
+  "border_width": 3,
   "rounding": 2,
   "animation_ms": 120,
   "animation_easing": "cubic",
@@ -179,6 +181,7 @@ the documented default.
 | `gaps_inner` | Gap between individual windows, pixels |
 | `show_border` | Paint the DWM accent border on the focused window |
 | `border_color_active` / `border_color_inactive` | `#RRGGBB` |
+| `border_width` | Thickness in pixels of the focused tile's accent frame, drawn by an overlay window; `0` disables it (the 1px DWM line stays) |
 | `rounding` | `0` default, `1` square, `2` rounded (Windows 11) |
 | `animation_ms` | Duration; `0` disables animation |
 | `animation_easing` | `linear`, `quad`, `cubic` or `expo` |

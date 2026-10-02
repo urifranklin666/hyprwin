@@ -6,6 +6,7 @@
 use crate::config::{size_limit, Config, Direction, LayoutKind, Rule};
 use crate::layout::{self, DwindleTree, Forest, Rect};
 use crate::monitor::{self, Monitor};
+use crate::overlay::Overlays;
 use crate::status::{FocusedStatus, MonitorStatus, Status};
 use crate::win32;
 use crate::workspace::{WorkspaceState, SCRATCHPAD_WORKSPACE};
@@ -48,6 +49,8 @@ pub struct Wm {
     scratch_saves: HashMap<usize, Rect>,
     next_id: usize,
     pub tiling_enabled: bool,
+    /// Per-monitor layered windows that draw the thick focused-tile accent.
+    overlays: Overlays,
 }
 
 fn key(hwnd: HWND) -> isize {
@@ -71,6 +74,7 @@ impl Wm {
             scratch_saves: HashMap::new(),
             next_id: 1,
             tiling_enabled: true,
+            overlays: Overlays::default(),
         }
     }
 
@@ -430,6 +434,9 @@ impl Wm {
     /// Recompute and apply geometry for one monitor.
     pub fn retile_monitor(&mut self, mon: isize) {
         if !self.tiling_enabled {
+            // Nothing will reposition the tiles, so a stale accent would sit
+            // over whatever moved or closed underneath it.
+            self.overlays.hide_all();
             return;
         }
         self.ensure_tree(mon);
@@ -542,6 +549,9 @@ impl Wm {
         // Every change to the layout funnels through a retile, so this is the one
         // place the status document needs to be republished.
         self.publish_status();
+        // The focused tile's accent may have moved with the layout, and this is
+        // reached after the animation has finished, so its new rect is in force.
+        self.apply_border_focus();
     }
 
     /// Write the status document if the user asked for one. Failures are logged
@@ -666,6 +676,9 @@ impl Wm {
             }
         }
         win32::animate_batch(&moves, self.cfg.animation_ms, &self.cfg.animation_easing);
+        // The scratchpad window can hold focus while it is down; its centred
+        // rect lands in `placed` here and not in `retile_monitor`.
+        self.apply_border_focus();
     }
 
     /// The centred rectangle the scratchpad occupies inside the work area.
@@ -756,7 +769,7 @@ impl Wm {
     /// looking at, and if the process simply exits they would stay hidden with no
     /// tray icon left to bring them back. Windows that are minimized are left
     /// alone for the same reason `apply_visibility` skips them.
-    pub fn reveal_all(&self) {
+    pub fn reveal_all(&mut self) {
         for w in self.windows.values() {
             if win32::is_minimized(w.hwnd) {
                 continue;
@@ -775,6 +788,8 @@ impl Wm {
                 win32::show(w.hwnd);
             }
         }
+        // Never leave a floating accent behind once the tiles go back.
+        self.overlays.hide_all();
     }
 
     /// Raise the topmost window of the active workspace into the foreground.
@@ -909,8 +924,9 @@ impl Wm {
 
     // ---------------------------------------------------------------- borders
 
-    pub fn apply_border_focus(&self) {
+    pub fn apply_border_focus(&mut self) {
         if !self.cfg.show_border {
+            self.overlays.hide_all();
             return;
         }
         let active = win32::foreground();
@@ -926,6 +942,29 @@ impl Wm {
                 inactive_color
             };
             win32::set_border(w.hwnd, color);
+        }
+
+        // A focused *tiled* window gets the thicker accent from the overlay. A
+        // floating or fullscreen window keeps only its 1px DWM line: the overlay
+        // frame would not match either's real geometry.
+        let frame = self
+            .id_of(active)
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .is_some_and(|w| !w.floating && !self.workspaces.is_fullscreen(*id))
+            })
+            .and_then(|id| self.placed.get(&id).map(|r| (id, *r)));
+        let width = self.cfg.border_width;
+        match frame {
+            Some((id, rect)) => {
+                let mon = self.windows[&id].monitor;
+                let color =
+                    crate::overlay::pixel(crate::config::parse_rgba(&self.cfg.border_color_active));
+                self.overlays
+                    .redraw(&self.monitors.clone(), Some((mon, rect)), width, color);
+            }
+            None => self.overlays.redraw(&self.monitors.clone(), None, width, 0),
         }
     }
 
@@ -965,6 +1004,10 @@ impl Wm {
         );
         if self.tiling_enabled {
             self.retile_all();
+        } else {
+            // Disabling does not retile, so the accent would otherwise stay put
+            // over tiles that are free to move from under it.
+            self.overlays.hide_all();
         }
         // Disabling does not retile, so without this the published document
         // would keep claiming tiling is on until some unrelated retile.
@@ -1140,6 +1183,9 @@ impl Wm {
             let rect = self.monitor_rect(mon);
             win32::animate_batch(&[(hwnd, rect)], self.cfg.animation_ms, &self.cfg.animation_easing);
             win32::set_foreground(hwnd);
+            // The window now fills the monitor, so its tile accent no longer
+            // matches where it is; the filter in `apply_border_focus` clears it.
+            self.apply_border_focus();
         } else {
             self.retile_monitor(mon);
         }
