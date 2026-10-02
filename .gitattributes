@@ -1,0 +1,11 @@
+# Store every text file with LF in both the repository and the working tree, so
+# line endings do not depend on a contributor's core.autocrlf setting (Windows
+# defaults to true, which otherwise rewrites LF to CRLF on checkout and warns on
+# every commit).
+* text=auto eol=lf
+
+# Never line-ending-convert binaries.
+*.exe binary
+*.dll binary
+*.png binary
+*.ico binary
