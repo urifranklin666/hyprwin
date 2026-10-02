@@ -130,6 +130,12 @@ fn run() -> Result<()> {
         let _ = SetConsoleCtrlHandler(Some(ctrl_handler), TRUE);
     }
 
+    // Publish once now that startup is done. The control pipe and the status
+    // file are otherwise only refreshed by a retile, so a session that adopts
+    // nothing — no windows open yet, or `manage_on_start` off — would answer
+    // `status` with `{}` and `monitors` with nothing at all.
+    wm.publish_status();
+
     println!("[hyprwin] running — Ctrl+C here, or tray icon -> Quit, to exit");
 
     let exit_code = message_loop(&mut wm, &rx, &regs);
