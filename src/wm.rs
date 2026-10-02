@@ -11,6 +11,7 @@ use crate::status::{FocusedStatus, MonitorStatus, Status};
 use crate::win32;
 use crate::workspace::{WorkspaceState, SCRATCHPAD_WORKSPACE};
 use std::collections::HashMap;
+use std::time::Instant;
 use windows::Win32::Foundation::HWND;
 
 /// Share of the work area the scratchpad covers when it drops down.
@@ -61,6 +62,10 @@ pub struct Wm {
     pub tiling_enabled: bool,
     /// Per-monitor layered windows that draw the thick focused-tile accent.
     overlays: Overlays,
+    /// The accent frames currently on screen, and the focused window they were
+    /// built for. Reused as the "from" side of a focus cross-fade.
+    last_frames: Vec<crate::overlay::Frame>,
+    last_focus: Option<isize>,
 }
 
 fn key(hwnd: HWND) -> isize {
@@ -85,6 +90,8 @@ impl Wm {
             next_id: 1,
             tiling_enabled: true,
             overlays: Overlays::default(),
+            last_frames: Vec::new(),
+            last_focus: None,
         }
     }
 
@@ -345,9 +352,11 @@ impl Wm {
             self.switch_workspace(mon, ws);
         }
         // The user aimed at one specific window; the workspace switch raises the
-        // first window it finds, so re-assert theirs afterwards.
+        // first window it finds, so re-assert theirs afterwards. Clicking a window
+        // is a focus change with the layout already settled, so the accent eases
+        // across to it.
         win32::set_foreground(hwnd);
-        self.apply_border_focus();
+        self.apply_border_focus_animated();
     }
 
     // ---------------------------------------------------------------- retiling
@@ -970,9 +979,88 @@ impl Wm {
 
     // ---------------------------------------------------------------- borders
 
+    /// Effective overlay corner radius: `border_radius`, or the DWM preference
+    /// when it is -1.
+    ///
+    /// The DWM rounds a window with a fixed radius (about 8px at 100% DPI) that
+    /// we cannot read back, so following it is a fixed default rather than a
+    /// measurement. `rounding: 2` is the only setting that rounds.
+    fn accent_radius(&self) -> i32 {
+        if self.cfg.border_radius >= 0 {
+            self.cfg.border_radius
+        } else if self.cfg.rounding == 2 {
+            8
+        } else {
+            0
+        }
+    }
+
+    /// Build the accent frames that should be on screen right now.
+    ///
+    /// The focused tile takes `border_width` and the active colour; every other
+    /// tiled window takes `border_width_inactive` and the inactive colour, and is
+    /// omitted entirely when that width is 0 (the default), leaving its 1px DWM
+    /// line. Floating and fullscreen windows are skipped: their real geometry is
+    /// not the rect the layout holds, so an overlay frame would not match.
+    fn accent_frames(&self) -> Vec<crate::overlay::Frame> {
+        if !self.cfg.show_border {
+            return Vec::new();
+        }
+        let active = win32::foreground();
+        let a = crate::overlay::pixel(crate::config::parse_rgba(&self.cfg.border_color_active));
+        // An unset second colour means a flat accent, which is a gradient whose
+        // two ends happen to be equal.
+        let alt = self.cfg.border_color_active_alt.trim();
+        let a2 = if alt.is_empty() {
+            a
+        } else {
+            crate::overlay::pixel(crate::config::parse_rgba(alt))
+        };
+        let inactive =
+            crate::overlay::pixel(crate::config::parse_rgba(&self.cfg.border_color_inactive));
+        let radius = self.accent_radius();
+        let mut frames = Vec::new();
+        for w in self.windows.values() {
+            if w.floating || self.workspaces.is_fullscreen(w.id) {
+                continue;
+            }
+            let Some(rect) = self.placed.get(&w.id) else {
+                continue;
+            };
+            let focused = w.hwnd == active;
+            let width = if focused {
+                self.cfg.border_width
+            } else {
+                self.cfg.border_width_inactive
+            };
+            if width <= 0 {
+                continue;
+            }
+            let Some(mon) = self.monitors.iter().find(|m| m.handle == w.monitor) else {
+                continue;
+            };
+            frames.push(crate::overlay::Frame {
+                monitor: w.monitor,
+                local: Rect::new(
+                    rect.x - mon.rect.x,
+                    rect.y - mon.rect.y,
+                    rect.w,
+                    rect.h,
+                ),
+                width,
+                radius,
+                color_a: if focused { a } else { inactive },
+                color_b: if focused { a2 } else { inactive },
+            });
+        }
+        frames
+    }
+
     pub fn apply_border_focus(&mut self) {
         if !self.cfg.show_border {
             self.overlays.hide_all();
+            self.last_frames.clear();
+            self.last_focus = None;
             return;
         }
         let active = win32::foreground();
@@ -989,29 +1077,65 @@ impl Wm {
             };
             win32::set_border(w.hwnd, color);
         }
+        let frames = self.accent_frames();
+        self.overlays.redraw(&self.monitors, &frames);
+        self.last_frames = frames;
+        self.last_focus = Some(active.0 as isize);
+    }
 
-        // A focused *tiled* window gets the thicker accent from the overlay. A
-        // floating or fullscreen window keeps only its 1px DWM line: the overlay
-        // frame would not match either's real geometry.
-        let frame = self
-            .id_of(active)
-            .filter(|id| {
-                self.windows
-                    .get(id)
-                    .is_some_and(|w| !w.floating && !self.workspaces.is_fullscreen(*id))
-            })
-            .and_then(|id| self.placed.get(&id).map(|r| (id, *r)));
-        let width = self.cfg.border_width;
-        match frame {
-            Some((id, rect)) => {
-                let mon = self.windows[&id].monitor;
-                let color =
-                    crate::overlay::pixel(crate::config::parse_rgba(&self.cfg.border_color_active));
-                self.overlays
-                    .redraw(&self.monitors.clone(), Some((mon, rect)), width, color);
-            }
-            None => self.overlays.redraw(&self.monitors.clone(), None, width, 0),
+    /// Apply the accent, cross-fading the colour over `animation_ms`.
+    ///
+    /// Use this when *focus* moved, so the new tile eases into the active colour
+    /// instead of snapping. It is a no-op when the focused window has not changed,
+    /// so a retile that only moves tiles does not pay for a fade it would not
+    /// show. With `animation_ms: 0` it is exactly `apply_border_focus`.
+    pub fn apply_border_focus_animated(&mut self) {
+        let active = win32::foreground();
+        let key = Some(active.0 as isize);
+        let to = self.accent_frames();
+        let duration = self.cfg.animation_ms;
+        // Nothing to fade to, or nobody moved: draw and remember. The fade is
+        // only for a focus *change*, so an unchanged focus takes the instant path.
+        if duration == 0
+            || self.last_focus == key
+            || self.last_frames.len() != to.len()
+            || self.last_frames.is_empty()
+        {
+            self.apply_border_focus();
+            return;
         }
+        // Pair each destination frame with the frame it is replacing. Frames are
+        // built in `windows` order, which is stable between calls, and any layout
+        // change that moved a window sends us down the instant path above.
+        let from = self.last_frames.clone();
+        let monitors = self.monitors.clone();
+        let start = Instant::now();
+        let total = (duration as f32 / 1000.0).max(0.001);
+        let frame_ms = 8u64;
+        let frames = crate::animation::frame_count(duration, frame_ms as u32);
+        for i in 0..=frames {
+            let t = if i == frames {
+                1.0
+            } else {
+                crate::animation::ease(&self.cfg.animation_easing, start.elapsed().as_secs_f32() / total)
+            };
+            let blend: Vec<crate::overlay::Frame> = from
+                .iter()
+                .zip(to.iter())
+                .map(|(f, d)| crate::overlay::Frame {
+                    color_a: crate::overlay::blend_pixel(f.color_a, d.color_a, t),
+                    color_b: crate::overlay::blend_pixel(f.color_b, d.color_b, t),
+                    ..*d
+                })
+                .collect();
+            self.overlays.redraw(&monitors, &blend);
+            if i != frames {
+                std::thread::sleep(std::time::Duration::from_millis(frame_ms));
+            }
+        }
+        self.overlays.redraw(&monitors, &to);
+        self.last_frames = to;
+        self.last_focus = key;
     }
 
     // ---------------------------------------------------------------- commands
@@ -1156,6 +1280,9 @@ impl Wm {
             if let Some(hwnd) = self.hwnd_of(target) {
                 win32::set_foreground(hwnd);
             }
+            // Focus moved between tiles with the layout untouched, so the accent
+            // eases onto the new tile rather than snapping.
+            self.apply_border_focus_animated();
         }
     }
 

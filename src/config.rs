@@ -82,11 +82,29 @@ pub struct Config {
     pub show_border: bool,
     /// Active window border colour, "#RRGGBB".
     pub border_color_active: String,
+    /// Second colour of the focused tile's gradient accent, "#RRGGBB".
+    ///
+    /// Empty (the default) keeps the accent one flat colour. When set, the
+    /// overlay accent runs from `border_color_active` at the top-left corner to
+    /// this colour at the bottom-right, the way a Hyprland gradient border does.
+    pub border_color_active_alt: String,
     /// Inactive window border colour, "#RRGGBB".
     pub border_color_inactive: String,
     /// Focused-window accent thickness in pixels, drawn by a per-monitor
     /// overlay window. 0 disables the accent; the 1px DWM line stays either way.
     pub border_width: i32,
+    /// Accent thickness for unfocused tiles, in pixels.
+    ///
+    /// 0 (the default) leaves inactive tiles with only their 1px DWM line. A
+    /// positive value draws the same overlay frame on every tiled window, in
+    /// `border_color_inactive`, which is the Hyprland active/inactive look.
+    pub border_width_inactive: i32,
+    /// Corner radius of the overlay accent, in pixels. -1 follows `rounding`.
+    ///
+    /// The DWM owns the window's real corner, so this exists to make the accent
+    /// hug it instead of drawing a square corner that overhangs. -1 mirrors the
+    /// DWM preference: rounded when `rounding` is 2, square otherwise.
+    pub border_radius: i32,
     /// DWM corner preference: 0 = default, 1 = do not round, 2 = round.
     pub rounding: i32,
     /// Animation duration in milliseconds. 0 disables animation.
@@ -119,8 +137,11 @@ impl Default for Config {
             gaps_inner: 6,
             show_border: true,
             border_color_active: "#7aa2f7".to_string(),
+            border_color_active_alt: String::new(),
             border_color_inactive: "#3b4261".to_string(),
             border_width: 3,
+            border_width_inactive: 0,
+            border_radius: -1,
             rounding: 2,
             animation_ms: 120,
             animation_easing: "cubic".to_string(),
@@ -281,6 +302,14 @@ impl Config {
         anyhow::ensure!(
             (0..=64).contains(&self.border_width),
             "border_width must be between 0 and 64"
+        );
+        anyhow::ensure!(
+            (0..=64).contains(&self.border_width_inactive),
+            "border_width_inactive must be between 0 and 64"
+        );
+        anyhow::ensure!(
+            (-1..=64).contains(&self.border_radius),
+            "border_radius must be -1 (follow rounding) or between 0 and 64"
         );
         anyhow::ensure!(
             self.master_ratio > 0.1 && self.master_ratio < 0.9,
