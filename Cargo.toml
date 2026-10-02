@@ -5,7 +5,8 @@ edition = "2021"
 rust-version = "1.75"
 description = "Hyprland-inspired dynamic tiling window manager for Windows"
 license = "MIT"
-repository = ""
+repository = "https://github.com/urifranklin666/hyprwin"
+readme = "README.md"
 default-run = "hyprwin"
 
 [[bin]]

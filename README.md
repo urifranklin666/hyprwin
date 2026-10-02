@@ -488,4 +488,4 @@ Run `target\release\hyprwin.exe`, then check:
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).
