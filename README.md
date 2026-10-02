@@ -13,7 +13,7 @@ komorebi and GlazeWM, and it is the only model Windows permits.
 
 ## Status
 
-Working, verified by the unit suite (`96 passed`), a clean release build and a
+Working, verified by the unit suite (`98 passed`), a clean release build and a
 live run against a two-monitor desktop. See
 [Manual smoke test](#manual-smoke-test) for the checklist to run yourself.
 
@@ -32,6 +32,7 @@ live run against a two-monitor desktop. See
 | Virtual workspaces | Per-monitor, numbered; off-workspace windows are hidden and shown again on return, with one raised into focus |
 | Scratchpad | A drop-down window over whatever workspace you are on, hideable with one key and reachable from any workspace |
 | Move between monitors | `movetomonitor` sends the focused window to the other display |
+| Keyboard escape from an empty workspace | On a monitor showing nothing, a workspace switch or scratchpad toggle follows the mouse instead of always hitting the primary display |
 | Keybinds | Configurable, with a `main` placeholder for the primary modifier |
 | Window rules | Match exe / class / title, then float (optionally by size), ignore, pin to a workspace, or send to a monitor or the scratchpad |
 | Status output | Writes `status.json` (active workspace, layout, focus, window counts, work areas) for a Rainmeter skin or any other dashboard to read |
@@ -132,6 +133,16 @@ it stays put while you switch workspaces until you pull it back up.
 
 It is deliberately explicit: the toggle never picks a window for you, so the
 same chord always means the same thing whatever is focused.
+
+### Which monitor a chord acts on
+
+Chords that do not name a window — `workspace`, the previous/next pair, and the
+scratchpad toggle — act on the monitor holding the focused window. When nothing
+is focused, which is what an empty workspace looks like, they follow the mouse
+instead: point at the monitor you mean. A focused window always wins over the
+pointer, so this only comes into play when there is no focused window at all.
+The primary display is the last resort, used when the cursor cannot be read or
+sits on a display HyprWin does not manage.
 
 ## Configuration
 
@@ -382,6 +393,10 @@ Run `target\release\hyprwin.exe`, then check:
     monitor, `hyprwinctl bogus` reports `unknown action` and exits non-zero, and
     `hyprwinctl quit` shuts HyprWin down exactly like the tray's Quit. With
     HyprWin stopped, `hyprwinctl monitors` says nothing is listening.
+23. On a two-monitor setup, close every window on the second monitor so it shows
+    an empty workspace. Put the mouse on that display and press `Alt+2`: the
+    **second** monitor switches, not the primary. `Alt+1` brings it back. With
+    the pointer on the primary instead, the chord acts there.
 
 ## License
 
