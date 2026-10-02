@@ -32,3 +32,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: hyprwin-${{ github.ref_name }}-windows-x86_64.zip
+          # Without this the release is published with a title and an asset but
+          # an empty body. The generated notes list the commits since the
+          # previous tag, which is the release history a reader wants.
+          generate_release_notes: true
