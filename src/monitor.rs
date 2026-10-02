@@ -1,11 +1,12 @@
 //! Display enumeration and work-area lookup.
 
 use crate::layout::Rect;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
-    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Monitor {
@@ -93,6 +94,20 @@ pub fn monitor_for_window(hwnd: HWND) -> Option<Monitor> {
         ),
         primary: info.dwFlags & 1 != 0,
     })
+}
+
+/// The monitor under the mouse cursor.
+///
+/// Used as the fallback target when no managed window has focus, so a workspace
+/// switch still lands on a monitor the user is looking at.
+pub fn monitor_for_cursor() -> Option<isize> {
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }.ok()?;
+    let hmon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    if hmon.0.is_null() {
+        return None;
+    }
+    Some(hmon.0 as isize)
 }
 
 /// Device name of a monitor (e.g. `\\.\DISPLAY1`). Unused today, kept for rules.

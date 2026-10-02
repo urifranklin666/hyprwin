@@ -1007,6 +1007,23 @@ impl Wm {
         self.id_of(win32::foreground())
     }
 
+    /// Which monitor a command that does not carry a window should act on.
+    ///
+    /// The focused window's monitor is the answer whenever there is a focused
+    /// window. It is not, though, always there: a monitor showing an empty
+    /// workspace has nothing to focus, and keying off focus alone would then
+    /// leave it with no keyboard escape at all — every hotkey would silently
+    /// act on some other display. Falling back to the monitor under the cursor
+    /// keeps the command pointed at the display the user is looking at.
+    fn command_monitor(&self) -> Option<isize> {
+        let focused = self
+            .focused()
+            .and_then(|id| self.windows.get(&id))
+            .map(|w| w.monitor);
+        let known: Vec<isize> = self.monitors.iter().map(|m| m.handle).collect();
+        pick_monitor(focused, monitor::monitor_for_cursor(), &known)
+    }
+
     fn cmd_focus(&mut self, arg: Option<&str>, swap: bool) {
         let Some(focus) = self.focused() else {
             return;
@@ -1138,11 +1155,9 @@ impl Wm {
 
     fn cmd_workspace(&mut self, arg: Option<&str>) {
         let Some(arg) = arg else { return };
-        let mon = self
-            .focused()
-            .map(|id| self.windows[&id].monitor)
-            .or_else(|| self.monitors.first().map(|m| m.handle))
-            .unwrap_or(0);
+        let Some(mon) = self.command_monitor() else {
+            return;
+        };
         let target = match arg {
             "next" => self.workspaces.workspace_after(mon, 1),
             "prev" => self.workspaces.workspace_after(mon, -1),
@@ -1209,11 +1224,9 @@ impl Wm {
     /// the same thing whatever is focused. With nothing on the scratchpad it sets
     /// the flag and shows nothing, which is exactly what Hyprland does.
     fn cmd_scratchpad(&mut self) {
-        let mon = self
-            .focused()
-            .map(|id| self.windows[&id].monitor)
-            .or_else(|| self.monitors.first().map(|m| m.handle))
-            .unwrap_or(0);
+        let Some(mon) = self.command_monitor() else {
+            return;
+        };
         let down = self.workspaces.toggle_scratchpad(mon);
         if down {
             self.focus_scratchpad(mon);
@@ -1329,6 +1342,21 @@ impl Wm {
     }
 }
 
+/// Choose the monitor a windowless command should act on.
+///
+/// Focus wins when there is any, because that is what the hotkey path has
+/// always done. With no focused window — the empty-workspace case — the cursor
+/// decides, and only then does it fall back to the primary. A cursor on a
+/// display we do not manage is ignored rather than trusted.
+fn pick_monitor(focused: Option<isize>, cursor: Option<isize>, known: &[isize]) -> Option<isize> {
+    if let Some(mon) = focused {
+        return Some(mon);
+    }
+    cursor
+        .filter(|h| known.contains(h))
+        .or_else(|| known.first().copied())
+}
+
 fn rule_matches(rule: &Rule, exe: &str, class: &str, title: &str) -> bool {
     let check = |pat: &Option<String>, value: &str| -> bool {
         match pat {
@@ -1438,5 +1466,26 @@ mod tests {
     #[test]
     fn wm_direction_alias_is_reachable() {
         assert_eq!(WmDirection::parse("left"), Some(Direction::Left));
+    }
+
+    /// A monitor showing an empty workspace has no focused window, so a
+    /// workspace switch used to fall through to the primary monitor and could
+    /// never reach any other display. The cursor now decides in that case.
+    #[test]
+    fn a_windowless_command_targets_the_monitor_under_the_cursor() {
+        let known = [10, 20];
+        assert_eq!(pick_monitor(None, Some(20), &known), Some(20));
+        // Cursor on a display we do not manage, or no cursor reading at all:
+        // the primary is the last resort rather than nothing happening.
+        assert_eq!(pick_monitor(None, Some(99), &known), Some(10));
+        assert_eq!(pick_monitor(None, None, &known), Some(10));
+        assert_eq!(pick_monitor(None, None, &[]), None);
+    }
+
+    /// Focus still outranks the cursor: aiming a hotkey at the window you are
+    /// on must not be redirected because the pointer happens to sit elsewhere.
+    #[test]
+    fn a_focused_window_outranks_the_cursor() {
+        assert_eq!(pick_monitor(Some(20), Some(10), &[10, 20]), Some(20));
     }
 }
