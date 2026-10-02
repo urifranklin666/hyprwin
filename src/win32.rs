@@ -232,6 +232,15 @@ pub fn unmaximize(hwnd: HWND) {
     }
 }
 
+/// Put a window back into the maximized state it was in before we adopted it.
+pub fn maximize(hwnd: HWND) {
+    if !is_maximized(hwnd) {
+        unsafe {
+            let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MAXIMIZE);
+        }
+    }
+}
+
 pub fn set_pos(hwnd: HWND, r: Rect) {
     let w = r.w.max(1);
     let h = r.h.max(1);

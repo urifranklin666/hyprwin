@@ -24,6 +24,16 @@ pub struct ManagedWindow {
     pub id: usize,
     pub monitor: isize,
     pub floating: bool,
+    /// Was the window already maximized when we adopted it?
+    ///
+    /// This decides which way `reveal_all` goes on the way out. A window
+    /// maximized *during* a run has to be un-maximized, or it is left zoomed over
+    /// the whole monitor. A window that arrived *already* maximized has to come
+    /// back maximized: the rectangle we captured at adoption is its maximized
+    /// one, so un-maximizing and then restoring that rectangle leaves it at the
+    /// maximized size with no maximized state — the half-restored look, arrived
+    /// at from the other side.
+    pub restore_maximized: bool,
 }
 
 pub struct Wm {
@@ -220,8 +230,13 @@ impl Wm {
 
         let id = self.next_id;
         self.next_id += 1;
-        // Remember where the window was before we take it over. `reveal_all`
-        // replays these on exit so quitting does not leave the desktop rearranged.
+        // Read the window's starting state *before* we touch it. `reveal_all`
+        // replays these on exit so quitting does not leave the desktop
+        // rearranged. The maximized flag in particular has to be read here: the
+        // un-maximize below clears it, and the rectangle captured while it is
+        // still set is the maximized one, which is what `reveal_all` must put
+        // back for a window that arrived maximized.
+        let restore_maximized = win32::is_maximized(hwnd);
         if let Some(r) = win32::rect_of(hwnd) {
             self.saved_rects.insert(id, r);
         }
@@ -234,6 +249,7 @@ impl Wm {
                 id,
                 monitor: mon,
                 floating: float,
+                restore_maximized,
             },
         );
         self.by_hwnd.insert(key(hwnd), id);
@@ -772,7 +788,9 @@ impl Wm {
     ///
     /// It also un-maximizes, because a window that was maximized while managed
     /// is otherwise left zoomed over the whole monitor: restoring its rectangle
-    /// alone does not clear the maximized state.
+    /// alone does not clear the maximized state. A window that was *already*
+    /// maximized when we adopted it goes back to maximized instead, the way we
+    /// found it.
     pub fn reveal_all(&mut self) {
         for w in self.windows.values() {
             if win32::is_minimized(w.hwnd) {
@@ -783,12 +801,9 @@ impl Wm {
             //
             // A window maximized while we managed it is still zoomed, and
             // `unmaximize` restores it to the size Windows remembers — not to
-            // the geometry we saved. For a window that arrived already maximized,
-            // `saved_rects` holds the *maximized* rect, because it is captured at
-            // adoption before the first un-maximize. So placing first would only
-            // be undone by the restore that followed it. Un-maximizing first also
-            // means the placement afterwards is the last word, which is what the
-            // caller wants.
+            // the geometry we saved. So placing first would only be undone by the
+            // restore that followed it, and un-maximizing first makes the
+            // placement afterwards the last word.
             //
             // This is unconditional, floating windows included. `SW_RESTORE` is
             // the only thing that clears the zoomed flag, so skipping it for a
@@ -803,6 +818,17 @@ impl Wm {
                 .or_else(|| self.saved_rects.get(&w.id));
             if let Some(r) = saved {
                 win32::set_pos(w.hwnd, *r);
+            }
+            // A window that arrived maximized has its maximized rectangle in
+            // `saved_rects`, so putting the flag back is what completes the
+            // restore: without it the window sits at the maximized size with no
+            // maximized state, which is the half-restored look from the other
+            // side. The rectangle above is ignored for a maximized window, so
+            // this has to come last — but only for windows that arrived this way,
+            // never for one maximized under our management, which must stay
+            // un-maximized.
+            if w.restore_maximized {
+                win32::maximize(w.hwnd);
             }
             if !win32::is_visible(w.hwnd) {
                 win32::show(w.hwnd);

@@ -26,7 +26,7 @@ live run against a two-monitor desktop. See
 | Maximized windows are re-tiled | A window maximised after it was adopted is un-maximised on the next retile instead of sitting zoomed over its tile |
 | Persistent split ratios | Resizing one split survives retiling; other windows do not jump |
 | Per-workspace layout memory | Leaving a workspace parks its dwindle tree, so windows return to the position they had |
-| Clean exit | Quitting un-hides windows parked on other workspaces and restores their original geometry |
+| Clean exit | Quitting un-hides windows parked on other workspaces and restores their original geometry, including whether each was maximized when HyprWin adopted it |
 | Gaps | Configurable outer (edge) and inner (between windows) |
 | Borders + rounding | DWM accent border, active/inactive colours, Win11 corner rounding |
 | Thick focused accent | A per-monitor overlay draws a `border_width`-pixel frame around the focused tile, on top of the 1px DWM line |
